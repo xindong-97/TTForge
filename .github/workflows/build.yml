@@ -1,7 +1,15 @@
-name: Build TTForge Nova
+name: Build TTForge Nova120
 on:
   push:
-    branches: [main]
+    paths:
+      - "TTForge.m"
+      - "NovaControlPanel.m"
+      - "NovaControlPanel.h"
+      - "NovaFloatingButton.m"
+      - "NovaFloatingButton.h"
+      - "NovaUIManager.m"
+      - "NovaUIManager.h"
+      - ".github/workflows/build.yml"
   workflow_dispatch:
 jobs:
   build:
@@ -10,18 +18,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build dylib
         run: |
+          set -e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK: $SDK"
-          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fno-objc-arc TTForge.m -o TTForge.o
-          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaUIManager.m -o NovaUIManager.o
-          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaFloatingButton.m -o NovaFloatingButton.o
-          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaControlPanel.m -o NovaControlPanel.o
-          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -dynamiclib -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Security -undefined dynamic_lookup -o TTForge_NovaUI_v7.34.dylib TTForge.o NovaUIManager.o NovaFloatingButton.o NovaControlPanel.o
-          ls -lh TTForge_NovaUI_v7.34.dylib
-          file TTForge_NovaUI_v7.34.dylib || true
-      - name: Upload dylib
-        uses: actions/upload-artifact@v4
+          mkdir -p out
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -fno-objc-arc -fblocks -c TTForge.m -o out/TTForge.o
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -fblocks -c NovaControlPanel.m -o out/NovaControlPanel.o
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -fblocks -c NovaFloatingButton.m -o out/NovaFloatingButton.o
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -fblocks -c NovaUIManager.m -o out/NovaUIManager.o
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -dynamiclib -fblocks -o out/TTForge_NovaUI_v7.35.dylib out/TTForge.o out/NovaControlPanel.o out/NovaFloatingButton.o out/NovaUIManager.o -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Security
+          file out/TTForge_NovaUI_v7.35.dylib
+          ls -lh out/
+      - uses: actions/upload-artifact@v4
         with:
-          name: TTForge-Nova-dylib
-          path: TTForge_NovaUI_v7.34.dylib
-          if-no-files-found: error
+          name: TTForge-Nova120-dylib
+          path: out/TTForge_NovaUI_v7.35.dylib
