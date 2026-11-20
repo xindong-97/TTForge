@@ -1,24 +1,27 @@
-name: Build TTForge
+name: Build TTForge Nova
 on:
   push:
     branches: [main]
   workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
       - name: Build dylib
         run: |
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK: $SDK"
-          clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" -dynamiclib -fno-objc-arc -framework UIKit -framework Foundation -undefined dynamic_lookup -o TTForge.dylib TTForge.m
-          ls -lh TTForge.dylib
-          file TTForge.dylib || true
+          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fno-objc-arc TTForge.m -o TTForge.o
+          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaUIManager.m -o NovaUIManager.o
+          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaFloatingButton.m -o NovaFloatingButton.o
+          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaControlPanel.m -o NovaControlPanel.o
+          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -dynamiclib -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Security -undefined dynamic_lookup -o TTForge_NovaUI_v7.33.dylib TTForge.o NovaUIManager.o NovaFloatingButton.o NovaControlPanel.o
+          ls -lh TTForge_NovaUI_v7.33.dylib
+          file TTForge_NovaUI_v7.33.dylib || true
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: TTForge-dylib
-          path: TTForge.dylib
+          name: TTForge-Nova-dylib
+          path: TTForge_NovaUI_v7.33.dylib
           if-no-files-found: error
