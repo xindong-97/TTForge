@@ -12,6 +12,10 @@ static NSTimeInterval gRTSelfActionTs = 0;
 static NSTimeInterval gRTDownMicTs = 0;
 static BOOL gRTUserMuteIntent = NO;
 static id gRTMeUser = nil;
+static unsigned int gRTMicStatusMuted = 0;
+static unsigned int gRTMicStatusUnmuted = 0;
+static BOOL gRTCalibMuted = NO;
+static BOOL gRTCalibUnmuted = NO;
 
 static void TTRTMarkSelfAction(void) {
     gRTSelfActionTs = [NSDate timeIntervalSinceReferenceDate];
@@ -742,6 +746,21 @@ static void rt_publishStream(id self, SEL _cmd) {
     if (orig) { @try { ((void (*)(id, SEL))orig)(self, _cmd); } @finally { TTRTOrigDone(self, _cmd, orig); } }
 }
 
+
+static void rt_reportRoomMicState(id self, SEL _cmd, unsigned int uid, unsigned int micId, unsigned int channelType, unsigned int channelId, unsigned int micStatus) {
+    TTLog(@"ROOMTEST reportRoomMicState uid=%u micId=%u chType=%u chId=%u micStatus=%u intent=%d antiMute=%d", uid, micId, channelType, channelId, micStatus, gRTUserMuteIntent, gRTAntiMute);
+    if (([NSDate timeIntervalSinceReferenceDate] - gRTSelfActionTs) < 5.0) {
+        if (gRTUserMuteIntent) { gRTMicStatusMuted = micStatus; gRTCalibMuted = YES; TTLog(@"ROOMTEST calib muted micStatus=%u", micStatus); }
+        else { gRTMicStatusUnmuted = micStatus; gRTCalibUnmuted = YES; TTLog(@"ROOMTEST calib unmuted micStatus=%u", micStatus); }
+    }
+    if (gRTAntiMute && !gRTUserMuteIntent && gRTCalibMuted && gRTCalibUnmuted && gRTMicStatusMuted != gRTMicStatusUnmuted && micStatus == gRTMicStatusMuted) {
+        TTLog(@"ROOMTEST reportRoomMicState REWRITE micStatus %u -> %u", micStatus, gRTMicStatusUnmuted);
+        micStatus = gRTMicStatusUnmuted;
+    }
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { @try { ((void (*)(id, SEL, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int))orig)(self, _cmd, uid, micId, channelType, channelId, micStatus); } @finally { TTRTOrigDone(self, _cmd, orig); } }
+}
+
 static void TTRTInstallHooks(void) {
     if (!gRTOrigImps) gRTOrigImps = [[NSMutableDictionary alloc] init];
     TTRTSwizzle(NSClassFromString(@"CommonRealTimeVoiceRoomViewController"), @selector(onMuteMicAction:tipsInView:muteToast:unmuteToast:), (IMP)rt_onMuteMicAction4);
@@ -817,6 +836,7 @@ static void TTRTInstallHooks(void) {
     TTRTSwizzle(NSClassFromString(@"RealTimeAVLiveMeUser"), @selector(genStreamID), (IMP)rt_genStreamID);
     TTRTSwizzle(NSClassFromString(@"RealTimeAVLiveMeUser"), @selector(amISilent), (IMP)rt_amISilent);
     TTRTSwizzle(NSClassFromString(@"RealTimeAVLiveMeUser"), @selector(publishStream), (IMP)rt_publishStream);
+    TTRTSwizzle(NSClassFromString(@"CommonChannelService"), @selector(reportRoomMicState:micID:channelType:channelId:micStatus:), (IMP)rt_reportRoomMicState);
     gRTOrigSnapshot = [[NSDictionary alloc] initWithDictionary:gRTOrigImps];
     TTLog(@"ROOMTEST hooks installed mute=%d clear=%d audio=%d skin=%d kick=%d upMic=%d island=%d dressId=%u", gRTAntiMute, gRTAntiClear, gRTAudio192, gRTSkin, gRTAntiKick, gRTUpMic, gRTIsland, gRTDressId);
 }
@@ -6230,7 +6250,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.44 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.45 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
