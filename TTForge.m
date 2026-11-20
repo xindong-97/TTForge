@@ -336,12 +336,37 @@ static NSString *TTRTKey(Class cls, SEL sel) {
     return [NSString stringWithFormat:@"%@|%@", NSStringFromClass(cls), NSStringFromSelector(sel)];
 }
 
-static IMP TTRTOrig(Class cls, SEL sel) {
-    for (Class c = cls; c; c = class_getSuperclass(c)) {
+static NSMutableArray *TTRTOrigStack(void) {
+    NSMutableDictionary *td = [[NSThread currentThread] threadDictionary];
+    NSMutableArray *st = [td objectForKey:@"ttforge.rtorigstack"];
+    if (!st) { st = [NSMutableArray array]; [td setObject:st forKey:@"ttforge.rtorigstack"]; }
+    return st;
+}
+
+static IMP TTRTOrig(id self, SEL sel) {
+    NSMutableArray *st = TTRTOrigStack();
+    IMP first = NULL;
+    for (Class c = [self class]; c; c = class_getSuperclass(c)) {
         IMP imp = (IMP)[[gRTOrigImps objectForKey:TTRTKey(c, sel)] pointerValue];
-        if (imp) return imp;
+        if (!imp) continue;
+        if (!first) first = imp;
+        NSString *key = [NSString stringWithFormat:@"%p|%@|%p", self, NSStringFromSelector(sel), imp];
+        if (![st containsObject:key]) { [st addObject:key]; return imp; }
+    }
+    if (first) {
+        NSString *key = [NSString stringWithFormat:@"%p|%@|%p", self, NSStringFromSelector(sel), first];
+        [st addObject:key];
+        return first;
     }
     return NULL;
+}
+
+static void TTRTOrigDone(id self, SEL sel, IMP imp) {
+    if (!imp) return;
+    NSMutableArray *st = TTRTOrigStack();
+    NSString *key = [NSString stringWithFormat:@"%p|%@|%p", self, NSStringFromSelector(sel), imp];
+    NSUInteger idx = [st indexOfObject:key];
+    if (idx != NSNotFound) [st removeObjectAtIndex:idx];
 }
 
 static void TTRTSwizzle(Class cls, SEL sel, IMP repl) {
@@ -349,6 +374,7 @@ static void TTRTSwizzle(Class cls, SEL sel, IMP repl) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) { TTLog(@"ROOMTEST MISS %@ %@", NSStringFromClass(cls), NSStringFromSelector(sel)); return; }
     IMP orig = method_getImplementation(m);
+    if (orig == repl) { TTLog(@"ROOMTEST SKIP %@ %@ already hooked", NSStringFromClass(cls), NSStringFromSelector(sel)); return; }
     const char *types = method_getTypeEncoding(m);
     BOOL added = class_addMethod(cls, sel, repl, types);
     if (added) {
@@ -371,14 +397,14 @@ static NSString *TTRTDesc(id obj) {
 static void rt_onMuteMicAction4(id self, SEL _cmd, BOOL mute, id tips, id muteToast, id unmuteToast) {
     TTLog(@"ROOMTEST onMuteMicAction mute=%d tips=%@ self=%@", mute, TTRTDesc(tips), NSStringFromClass([self class]));
     if (gRTAntiMute && mute) { TTLog(@"ROOMTEST AntiMute BLOCK mute"); return; }
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, BOOL, id, id, id))orig)(self, _cmd, mute, tips, muteToast, unmuteToast);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, BOOL, id, id, id))orig)(self, _cmd, mute, tips, muteToast, unmuteToast); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static BOOL rt_shouldIgnoreMuteMic(id self, SEL _cmd, id arg) {
     BOOL origVal = NO;
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) origVal = ((BOOL (*)(id, SEL, id))orig)(self, _cmd, arg);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { origVal = ((BOOL (*)(id, SEL, id))orig)(self, _cmd, arg); TTRTOrigDone(self, _cmd, orig); }
     TTLog(@"ROOMTEST shouldIgnoreMuteMic arg=%@ orig=%d antiMute=%d", TTRTDesc(arg), origVal, gRTAntiMute);
     if (gRTAntiMute) return YES;
     return origVal;
@@ -387,58 +413,62 @@ static BOOL rt_shouldIgnoreMuteMic(id self, SEL _cmd, id arg) {
 static void rt_onKicked(id self, SEL _cmd, id msg) {
     TTLog(@"ROOMTEST KICK %@ msg=%@ self=%@", NSStringFromSelector(_cmd), TTRTDesc(msg), NSStringFromClass([self class]));
     if (gRTAntiKick) { TTLog(@"ROOMTEST AntiKick BLOCK %@", NSStringFromSelector(_cmd)); return; }
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, msg);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, id))orig)(self, _cmd, msg); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_clearData(id self, SEL _cmd) {
     TTLog(@"ROOMTEST CLEAR %@ self=%@", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
     if (gRTAntiClear) { TTLog(@"ROOMTEST AntiClear BLOCK %@", NSStringFromSelector(_cmd)); return; }
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL))orig)(self, _cmd); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static id rt_jsUiClear(id self, SEL _cmd, id arg, id callback) {
     TTLog(@"ROOMTEST jsUi_clearChatBoxChannel arg=%@ cb=%@ self=%@", TTRTDesc(arg), TTRTDesc(callback), NSStringFromClass([self class]));
     if (gRTAntiClear) { TTLog(@"ROOMTEST AntiClear BLOCK jsUi_clear"); return nil; }
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) return ((id (*)(id, SEL, id, id))orig)(self, _cmd, arg, callback);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { id _rtRet = ((id (*)(id, SEL, id, id))orig)(self, _cmd, arg, callback); TTRTOrigDone(self, _cmd, orig); return _rtRet; }
     return nil;
 }
 
 static void rt_updateAudioBitRate(id self, SEL _cmd, id arg) {
     TTLog(@"ROOMTEST updateAudioBitRate arg=%@ self=%@ audio192=%d", TTRTDesc(arg), NSStringFromClass([self class]), gRTAudio192);
-    IMP orig = TTRTOrig([self class], _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
     if (!orig) return;
     if (gRTAudio192 && [arg isKindOfClass:[NSNumber class]]) {
         TTLog(@"ROOMTEST Audio192 REPLACE %@ -> 192000", arg);
         ((void (*)(id, SEL, id))orig)(self, _cmd, @(192000));
+        TTRTOrigDone(self, _cmd, orig);
         return;
     }
     ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
+    TTRTOrigDone(self, _cmd, orig);
 }
 
 static void rt_onChannelAudioBitRateChanged(id self, SEL _cmd, unsigned int channelId, id arg) {
     TTLog(@"ROOMTEST onChannelId:audioBitRateChanged channel=%u arg=%@", channelId, TTRTDesc(arg));
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, unsigned int, id))orig)(self, _cmd, channelId, arg);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, unsigned int, id))orig)(self, _cmd, channelId, arg); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_onRoomSuitDressIdUpdatedTo(id self, SEL _cmd, unsigned int dressId) {
     TTLog(@"ROOMTEST onRoomSuitDressIdUpdatedTo dressId=%u skin=%d override=%u", dressId, gRTSkin, gRTDressId);
-    IMP orig = TTRTOrig([self class], _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
     if (!orig) return;
     if (gRTSkin && gRTDressId > 0) {
         ((void (*)(id, SEL, unsigned int))orig)(self, _cmd, gRTDressId);
+        TTRTOrigDone(self, _cmd, orig);
         return;
     }
     ((void (*)(id, SEL, unsigned int))orig)(self, _cmd, dressId);
+    TTRTOrigDone(self, _cmd, orig);
 }
 
 static BOOL rt_supportChangemic(id self, SEL _cmd, id micSpace, id *tip) {
     BOOL origVal = NO;
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) origVal = ((BOOL (*)(id, SEL, id, id *))orig)(self, _cmd, micSpace, tip);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { origVal = ((BOOL (*)(id, SEL, id, id *))orig)(self, _cmd, micSpace, tip); TTRTOrigDone(self, _cmd, orig); }
     TTLog(@"ROOMTEST supportChangemic micSpace=%@ orig=%d upMic=%d self=%@", TTRTDesc(micSpace), origVal, gRTUpMic, NSStringFromClass([self class]));
     if (gRTUpMic) return YES;
     return origVal;
@@ -446,8 +476,8 @@ static BOOL rt_supportChangemic(id self, SEL _cmd, id micSpace, id *tip) {
 
 static BOOL rt_supportChangemicCb(id self, SEL _cmd, id micSpace, id *tip, id callback) {
     BOOL origVal = NO;
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) origVal = ((BOOL (*)(id, SEL, id, id *, id))orig)(self, _cmd, micSpace, tip, callback);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { origVal = ((BOOL (*)(id, SEL, id, id *, id))orig)(self, _cmd, micSpace, tip, callback); TTRTOrigDone(self, _cmd, orig); }
     TTLog(@"ROOMTEST supportChangemic:tip:callback micSpace=%@ orig=%d upMic=%d self=%@", TTRTDesc(micSpace), origVal, gRTUpMic, NSStringFromClass([self class]));
     if (gRTUpMic) return YES;
     return origVal;
@@ -455,105 +485,97 @@ static BOOL rt_supportChangemicCb(id self, SEL _cmd, id micSpace, id *tip, id ca
 
 static BOOL rt_isCanChangeMeToMic(id self, SEL _cmd, id arg, BOOL isMeOnMic, id *reason, id callback) {
     BOOL origVal = NO;
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) origVal = ((BOOL (*)(id, SEL, id, BOOL, id *, id))orig)(self, _cmd, arg, isMeOnMic, reason, callback);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { origVal = ((BOOL (*)(id, SEL, id, BOOL, id *, id))orig)(self, _cmd, arg, isMeOnMic, reason, callback); TTRTOrigDone(self, _cmd, orig); }
     TTLog(@"ROOMTEST isCanChangeMeToMic arg=%@ isMeOnMic=%d orig=%d upMic=%d self=%@", TTRTDesc(arg), isMeOnMic, origVal, gRTUpMic, NSStringFromClass([self class]));
     if (gRTUpMic) return YES;
     return origVal;
 }
 
 static id rt_getChannelLiveActivityContainerView(id self, SEL _cmd) {
-    IMP orig = TTRTOrig([self class], _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
     id v = nil;
-    if (orig) v = ((id (*)(id, SEL))orig)(self, _cmd);
+    if (orig) { v = ((id (*)(id, SEL))orig)(self, _cmd); TTRTOrigDone(self, _cmd, orig); }
     TTLog(@"ROOMTEST getChannelLiveActivityContainerView -> %@ island=%d", TTRTDesc(v), gRTIsland);
     return v;
 }
 
 static void rt_registerLiveActivity(id self, SEL _cmd, id a, id b, long long seq) {
     TTLog(@"ROOMTEST registerLiveActivity %@ a=%@ b=%@ seq=%lld self=%@", NSStringFromSelector(_cmd), TTRTDesc(a), TTRTDesc(b), seq, NSStringFromClass([self class]));
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, id, id, long long))orig)(self, _cmd, a, b, seq);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, id, id, long long))orig)(self, _cmd, a, b, seq); TTRTOrigDone(self, _cmd, orig); }
 }
 
-
-static NSString *TTRTStack(void) {
-    NSArray *syms = [NSThread callStackSymbols];
-    NSMutableString *out = [NSMutableString string];
-    NSUInteger n = MIN((NSUInteger)8, syms.count);
-    for (NSUInteger i = 1; i < n; i++) {
-        [out appendFormat:@" | %@", syms[i]];
-    }
-    return out;
-}
 
 static void rt_clearBoxAllMsgs(id self, SEL _cmd) {
     TTLog(@"ROOMTEST clearBoxAllMsgs self=%@ antiClear=%d", NSStringFromClass([self class]), gRTAntiClear);
     if (gRTAntiClear) { TTLog(@"ROOMTEST AntiClear BLOCK clearBoxAllMsgs"); return; }
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL))orig)(self, _cmd); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_clearMessageWithTabidList(id self, SEL _cmd, id arg) {
     TTLog(@"ROOMTEST clearMessageWithTabidList arg=%@ self=%@ antiClear=%d", TTRTDesc(arg), NSStringFromClass([self class]), gRTAntiClear);
     if (gRTAntiClear) { TTLog(@"ROOMTEST AntiClear BLOCK clearMessageWithTabidList"); return; }
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, id))orig)(self, _cmd, arg); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_setMicEnabled(id self, SEL _cmd, BOOL enabled) {
-    TTLog(@"ROOMTEST setMicEnabled=%d self=%@ antiMute=%d stack:%@", enabled, NSStringFromClass([self class]), gRTAntiMute, TTRTStack());
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, enabled);
+    TTLog(@"ROOMTEST setMicEnabled=%d self=%@ antiMute=%d ra:%p", enabled, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, enabled); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_setSilence(id self, SEL _cmd, BOOL silence) {
-    TTLog(@"ROOMTEST setSilence=%d self=%@ antiMute=%d stack:%@", silence, NSStringFromClass([self class]), gRTAntiMute, TTRTStack());
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, silence);
+    TTLog(@"ROOMTEST setSilence=%d self=%@ antiMute=%d ra:%p", silence, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, silence); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_onAmISilentChangeTo(id self, SEL _cmd, BOOL silent) {
-    TTLog(@"ROOMTEST onAmISilentChangeTo=%d self=%@ antiMute=%d stack:%@", silent, NSStringFromClass([self class]), gRTAntiMute, TTRTStack());
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, silent);
+    TTLog(@"ROOMTEST onAmISilentChangeTo=%d self=%@ antiMute=%d ra:%p", silent, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, silent); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_onButtonMuteMyMicTapped(id self, SEL _cmd) {
     TTLog(@"ROOMTEST onButtonMuteMyMicTapped self=%@ antiMute=%d", NSStringFromClass([self class]), gRTAntiMute);
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL))orig)(self, _cmd); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_handleTap(id self, SEL _cmd, id arg) {
     TTLog(@"ROOMTEST handleTap arg=%@ self=%@ upMic=%d", TTRTDesc(arg), NSStringFromClass([self class]), gRTUpMic);
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, id))orig)(self, _cmd, arg); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_onMicViewClicked(id self, SEL _cmd, id arg) {
     TTLog(@"ROOMTEST onMicViewClicked arg=%@ self=%@ upMic=%d", TTRTDesc(arg), NSStringFromClass([self class]), gRTUpMic);
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, id))orig)(self, _cmd, arg); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void rt_upMicWithMicIdToken(id self, SEL _cmd, unsigned int micId, id token) {
-    TTLog(@"ROOMTEST upMicWithMicId=%u token=%@ self=%@ upMic=%d stack:%@", micId, TTRTDesc(token), NSStringFromClass([self class]), gRTUpMic, TTRTStack());
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL, unsigned int, id))orig)(self, _cmd, micId, token);
+    TTLog(@"ROOMTEST upMicWithMicId=%u token=%@ self=%@ upMic=%d ra:%p", micId, TTRTDesc(token), NSStringFromClass([self class]), gRTUpMic, __builtin_return_address(0));
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL, unsigned int, id))orig)(self, _cmd, micId, token); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static BOOL rt_icanChangeToMicView(id self, SEL _cmd, id arg) {
-    IMP orig = TTRTOrig([self class], _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
     BOOL origVal = orig ? ((BOOL (*)(id, SEL, id))orig)(self, _cmd, arg) : NO;
+    if (orig) TTRTOrigDone(self, _cmd, orig);
     TTLog(@"ROOMTEST icanChangeToMicView arg=%@ orig=%d upMic=%d self=%@", TTRTDesc(arg), origVal, gRTUpMic, NSStringFromClass([self class]));
     if (gRTUpMic) return YES;
     return origVal;
 }
 
 static id rt_decideChainNodesBeforeUpMic(id self, SEL _cmd) {
-    IMP orig = TTRTOrig([self class], _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
     id r = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
+    if (orig) TTRTOrigDone(self, _cmd, orig);
     TTLog(@"ROOMTEST decideChainNodesBeforeUpMic -> %@ upMic=%d self=%@", TTRTDesc(r), gRTUpMic, NSStringFromClass([self class]));
     return r;
 }
@@ -562,8 +584,8 @@ static id rt_decideChainNodesBeforeUpMic(id self, SEL _cmd) {
 static void rt_clearVoid(id self, SEL _cmd) {
     TTLog(@"ROOMTEST %@ self=%@ antiClear=%d", NSStringFromSelector(_cmd), NSStringFromClass([self class]), gRTAntiClear);
     if (gRTAntiClear) { TTLog(@"ROOMTEST AntiClear BLOCK %@", NSStringFromSelector(_cmd)); return; }
-    IMP orig = TTRTOrig([self class], _cmd);
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    IMP orig = TTRTOrig(self, _cmd);
+    if (orig) { ((void (*)(id, SEL))orig)(self, _cmd); TTRTOrigDone(self, _cmd, orig); }
 }
 
 static void TTRTInstallHooks(void) {
@@ -6033,7 +6055,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.38 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.39 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
