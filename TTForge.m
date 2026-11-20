@@ -23,6 +23,7 @@ static unsigned int gRTReportChType = 0;
 static unsigned int gRTReportChId = 0;
 static id gRTMicControl = nil;
 static id gRTVC = nil;
+static NSTimeInterval gRTAutoSeatTs = 0;
 
 static void TTRTMarkSelfAction(void) {
     gRTSelfActionTs = [NSDate timeIntervalSinceReferenceDate];
@@ -423,6 +424,7 @@ static NSString *TTRTDesc(id obj) {
 }
 
 static void rt_onMuteMicAction4(id self, SEL _cmd, BOOL mute, id tips, id muteToast, id unmuteToast) {
+    if (gRTVC != self) { [gRTVC release]; gRTVC = [self retain]; }
     TTLog(@"ROOMTEST onMuteMicAction mute=%d tips=%@ self=%@", mute, TTRTDesc(tips), NSStringFromClass([self class]));
     if (TTRTIsSelfAction()) { gRTUserMuteIntent = mute; TTLog(@"ROOMTEST userMuteIntent=%d", mute); }
     if (gRTAntiMute && mute && !TTRTIsSelfAction() && !gRTUserMuteIntent) { TTLog(@"ROOMTEST AntiMute BLOCK mute"); return; }
@@ -431,6 +433,7 @@ static void rt_onMuteMicAction4(id self, SEL _cmd, BOOL mute, id tips, id muteTo
 }
 
 static BOOL rt_shouldIgnoreMuteMic(id self, SEL _cmd, id arg) {
+    if (gRTMicControl != self) { [gRTMicControl release]; gRTMicControl = [self retain]; }
     BOOL origVal = NO;
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { origVal = ((BOOL (*)(id, SEL, id))orig)(self, _cmd, arg); } @finally { TTRTOrigDone(self, _cmd, orig); } }
@@ -491,7 +494,7 @@ static void rt_onRoomSuitDressIdUpdatedTo(id self, SEL _cmd, unsigned int dressI
 }
 
 static BOOL rt_supportChangemic(id self, SEL _cmd, id micSpace, id *tip) {
-    gRTMicControl = self;
+    if (gRTMicControl != self) { [gRTMicControl release]; gRTMicControl = [self retain]; }
     BOOL origVal = NO;
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { origVal = ((BOOL (*)(id, SEL, id, id *))orig)(self, _cmd, micSpace, tip); } @finally { TTRTOrigDone(self, _cmd, orig); } }
@@ -582,7 +585,7 @@ static void rt_handleTap(id self, SEL _cmd, id arg) {
 }
 
 static void rt_onMicViewClicked(id self, SEL _cmd, id arg) {
-    gRTVC = self;
+    if (gRTVC != self) { [gRTVC release]; gRTVC = [self retain]; }
     TTLog(@"ROOMTEST onMicViewClicked arg=%@ self=%@ upMic=%d", TTRTDesc(arg), NSStringFromClass([self class]), gRTUpMic);
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL, id))orig)(self, _cmd, arg); } @finally { TTRTOrigDone(self, _cmd, orig); } }
@@ -648,6 +651,8 @@ static void rt_enableMic(id self, SEL _cmd, BOOL enabled) {
 
 
 static void TTRTAutoSeatChange(void) {
+    NSTimeInterval nowTs = [NSDate timeIntervalSinceReferenceDate];
+    if (nowTs - gRTAutoSeatTs < 5.0) { TTLog(@"ROOMTEST AUTO SEAT cooldown skip"); return; }
     if (!gRTMicControl || !gRTVC) { TTLog(@"ROOMTEST AUTO SEAT no capture micControl=%@ vc=%@", TTRTDesc(gRTMicControl), TTRTDesc(gRTVC)); return; }
     if (![gRTMicControl respondsToSelector:@selector(micSpaces)] || ![gRTMicControl respondsToSelector:@selector(micViewForMicId:)] || ![gRTVC respondsToSelector:@selector(onMicViewClicked:)]) { TTLog(@"ROOMTEST AUTO SEAT selector missing"); return; }
     id spaces = ((id (*)(id, SEL))objc_msgSend)(gRTMicControl, @selector(micSpaces));
@@ -657,9 +662,12 @@ static void TTRTAutoSeatChange(void) {
         BOOL empty = ((BOOL (*)(id, SEL))objc_msgSend)(sp, @selector(isEmpty));
         if (!empty) continue;
         unsigned int mid = ((unsigned int (*)(id, SEL))objc_msgSend)(sp, @selector(micId));
+        if (mid == 1) continue;
         id view = ((id (*)(id, SEL, unsigned int))objc_msgSend)(gRTMicControl, @selector(micViewForMicId:), mid);
-        TTLog(@"ROOMTEST AUTO SEAT free micId=%u view=%@", mid, TTRTDesc(view));
+        long long mstate = [sp respondsToSelector:@selector(micState)] ? ((long long (*)(id, SEL))objc_msgSend)(sp, @selector(micState)) : -1;
+        TTLog(@"ROOMTEST AUTO SEAT free micId=%u micState=%lld view=%@", mid, mstate, TTRTDesc(view));
         if (view) {
+            gRTAutoSeatTs = nowTs;
             ((void (*)(id, SEL, id))objc_msgSend)(gRTVC, @selector(onMicViewClicked:), view);
             TTLog(@"ROOMTEST AUTO SEAT onMicViewClicked sent micId=%u", mid);
             return;
@@ -669,7 +677,7 @@ static void TTRTAutoSeatChange(void) {
 }
 
 static void rt_setMute(id self, SEL _cmd, BOOL mute) {
-    gRTMeUser = self;
+    if (gRTMeUser != self) { [gRTMeUser release]; gRTMeUser = [self retain]; }
     TTLog(@"ROOMTEST setMute=%d self=%@ antiMute=%d ra:%p", mute, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
     if (gRTAntiMute && mute && !gRTUserMuteIntent && !TTRTIsSelfDownMic()) {
         TTLog(@"ROOMTEST AntiMute BLOCK setMute=1");
@@ -786,7 +794,7 @@ static BOOL rt_amISilent(id self, SEL _cmd) {
 }
 
 static void rt_publishStream(id self, SEL _cmd) {
-    gRTMeUser = self;
+    if (gRTMeUser != self) { [gRTMeUser release]; gRTMeUser = [self retain]; }
     TTLog(@"ROOMTEST publishStream self=%@ antiMute=%d intent=%d", NSStringFromClass([self class]), gRTAntiMute, gRTUserMuteIntent);
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL))orig)(self, _cmd); } @finally { TTRTOrigDone(self, _cmd, orig); } }
@@ -794,7 +802,7 @@ static void rt_publishStream(id self, SEL _cmd) {
 
 
 static void rt_reportRoomMicState(id self, SEL _cmd, unsigned int uid, unsigned int micId, unsigned int channelType, unsigned int channelId, unsigned int micStatus) {
-    gRTReportService = self;
+    if (gRTReportService != self) { [gRTReportService release]; gRTReportService = [self retain]; }
     gRTReportUid = uid;
     gRTReportMicId = micId;
     gRTReportChType = channelType;
@@ -6301,7 +6309,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.47 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.48 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
