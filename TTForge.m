@@ -16,6 +16,11 @@ static unsigned int gRTMicStatusMuted = 0;
 static unsigned int gRTMicStatusUnmuted = 0;
 static BOOL gRTCalibMuted = NO;
 static BOOL gRTCalibUnmuted = NO;
+static id gRTReportService = nil;
+static unsigned int gRTReportUid = 0;
+static unsigned int gRTReportMicId = 0;
+static unsigned int gRTReportChType = 0;
+static unsigned int gRTReportChId = 0;
 
 static void TTRTMarkSelfAction(void) {
     gRTSelfActionTs = [NSDate timeIntervalSinceReferenceDate];
@@ -649,6 +654,18 @@ static void rt_setMute(id self, SEL _cmd, BOOL mute) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(self, @selector(rePublishStreamWhenSilentChangeTo:), NO);
             TTLog(@"ROOMTEST republish non-silent stream");
         }
+        if (gRTCalibUnmuted && gRTReportService && [gRTReportService respondsToSelector:@selector(reportRoomMicState:micID:channelType:channelId:micStatus:)]) {
+            id svc = gRTReportService;
+            unsigned int ruid = gRTReportUid;
+            unsigned int rmic = gRTReportMicId;
+            unsigned int rtype = gRTReportChType;
+            unsigned int rch = gRTReportChId;
+            unsigned int rstatus = gRTMicStatusUnmuted;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                ((void (*)(id, SEL, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int))objc_msgSend)(svc, @selector(reportRoomMicState:micID:channelType:channelId:micStatus:), ruid, rmic, rtype, rch, rstatus);
+                TTLog(@"ROOMTEST FORCE REPORT micStatus=%u", rstatus);
+            });
+        }
         return;
     }
     IMP orig = TTRTOrig(self, _cmd);
@@ -748,6 +765,11 @@ static void rt_publishStream(id self, SEL _cmd) {
 
 
 static void rt_reportRoomMicState(id self, SEL _cmd, unsigned int uid, unsigned int micId, unsigned int channelType, unsigned int channelId, unsigned int micStatus) {
+    gRTReportService = self;
+    gRTReportUid = uid;
+    gRTReportMicId = micId;
+    gRTReportChType = channelType;
+    gRTReportChId = channelId;
     TTLog(@"ROOMTEST reportRoomMicState uid=%u micId=%u chType=%u chId=%u micStatus=%u intent=%d antiMute=%d", uid, micId, channelType, channelId, micStatus, gRTUserMuteIntent, gRTAntiMute);
     if (([NSDate timeIntervalSinceReferenceDate] - gRTSelfActionTs) < 5.0) {
         if (gRTUserMuteIntent) { gRTMicStatusMuted = micStatus; gRTCalibMuted = YES; TTLog(@"ROOMTEST calib muted micStatus=%u", micStatus); }
@@ -6250,7 +6272,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.45 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.46 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
