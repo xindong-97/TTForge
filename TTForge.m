@@ -337,7 +337,11 @@ static NSString *TTRTKey(Class cls, SEL sel) {
 }
 
 static IMP TTRTOrig(Class cls, SEL sel) {
-    return (IMP)[[gRTOrigImps objectForKey:TTRTKey(cls, sel)] pointerValue];
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        IMP imp = (IMP)[[gRTOrigImps objectForKey:TTRTKey(c, sel)] pointerValue];
+        if (imp) return imp;
+    }
+    return NULL;
 }
 
 static void TTRTSwizzle(Class cls, SEL sel, IMP repl) {
@@ -6016,7 +6020,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.36 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.37 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
