@@ -21,6 +21,8 @@ static unsigned int gRTReportUid = 0;
 static unsigned int gRTReportMicId = 0;
 static unsigned int gRTReportChType = 0;
 static unsigned int gRTReportChId = 0;
+static id gRTMicControl = nil;
+static id gRTVC = nil;
 
 static void TTRTMarkSelfAction(void) {
     gRTSelfActionTs = [NSDate timeIntervalSinceReferenceDate];
@@ -489,6 +491,7 @@ static void rt_onRoomSuitDressIdUpdatedTo(id self, SEL _cmd, unsigned int dressI
 }
 
 static BOOL rt_supportChangemic(id self, SEL _cmd, id micSpace, id *tip) {
+    gRTMicControl = self;
     BOOL origVal = NO;
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { origVal = ((BOOL (*)(id, SEL, id, id *))orig)(self, _cmd, micSpace, tip); } @finally { TTRTOrigDone(self, _cmd, orig); } }
@@ -579,6 +582,7 @@ static void rt_handleTap(id self, SEL _cmd, id arg) {
 }
 
 static void rt_onMicViewClicked(id self, SEL _cmd, id arg) {
+    gRTVC = self;
     TTLog(@"ROOMTEST onMicViewClicked arg=%@ self=%@ upMic=%d", TTRTDesc(arg), NSStringFromClass([self class]), gRTUpMic);
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL, id))orig)(self, _cmd, arg); } @finally { TTRTOrigDone(self, _cmd, orig); } }
@@ -642,6 +646,28 @@ static void rt_enableMic(id self, SEL _cmd, BOOL enabled) {
     if (orig) { @try { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, enabled); } @finally { TTRTOrigDone(self, _cmd, orig); } }
 }
 
+
+static void TTRTAutoSeatChange(void) {
+    if (!gRTMicControl || !gRTVC) { TTLog(@"ROOMTEST AUTO SEAT no capture micControl=%@ vc=%@", TTRTDesc(gRTMicControl), TTRTDesc(gRTVC)); return; }
+    if (![gRTMicControl respondsToSelector:@selector(micSpaces)] || ![gRTMicControl respondsToSelector:@selector(micViewForMicId:)] || ![gRTVC respondsToSelector:@selector(onMicViewClicked:)]) { TTLog(@"ROOMTEST AUTO SEAT selector missing"); return; }
+    id spaces = ((id (*)(id, SEL))objc_msgSend)(gRTMicControl, @selector(micSpaces));
+    if (!spaces) { TTLog(@"ROOMTEST AUTO SEAT micSpaces nil"); return; }
+    for (id sp in spaces) {
+        if (![sp respondsToSelector:@selector(isEmpty)] || ![sp respondsToSelector:@selector(micId)]) continue;
+        BOOL empty = ((BOOL (*)(id, SEL))objc_msgSend)(sp, @selector(isEmpty));
+        if (!empty) continue;
+        unsigned int mid = ((unsigned int (*)(id, SEL))objc_msgSend)(sp, @selector(micId));
+        id view = ((id (*)(id, SEL, unsigned int))objc_msgSend)(gRTMicControl, @selector(micViewForMicId:), mid);
+        TTLog(@"ROOMTEST AUTO SEAT free micId=%u view=%@", mid, TTRTDesc(view));
+        if (view) {
+            ((void (*)(id, SEL, id))objc_msgSend)(gRTVC, @selector(onMicViewClicked:), view);
+            TTLog(@"ROOMTEST AUTO SEAT onMicViewClicked sent micId=%u", mid);
+            return;
+        }
+    }
+    TTLog(@"ROOMTEST AUTO SEAT no free seat");
+}
+
 static void rt_setMute(id self, SEL _cmd, BOOL mute) {
     gRTMeUser = self;
     TTLog(@"ROOMTEST setMute=%d self=%@ antiMute=%d ra:%p", mute, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
@@ -666,6 +692,9 @@ static void rt_setMute(id self, SEL _cmd, BOOL mute) {
                 TTLog(@"ROOMTEST FORCE REPORT micStatus=%u", rstatus);
             });
         }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            TTRTAutoSeatChange();
+        });
         return;
     }
     IMP orig = TTRTOrig(self, _cmd);
@@ -6272,7 +6301,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.46 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.47 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
