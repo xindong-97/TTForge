@@ -10,6 +10,7 @@ static BOOL gH5Capture = NO;
 static BOOL gRTAntiMute = NO;
 static NSTimeInterval gRTSelfActionTs = 0;
 static NSTimeInterval gRTDownMicTs = 0;
+static BOOL gRTUserMuteIntent = NO;
 
 static void TTRTMarkSelfAction(void) {
     gRTSelfActionTs = [NSDate timeIntervalSinceReferenceDate];
@@ -411,7 +412,8 @@ static NSString *TTRTDesc(id obj) {
 
 static void rt_onMuteMicAction4(id self, SEL _cmd, BOOL mute, id tips, id muteToast, id unmuteToast) {
     TTLog(@"ROOMTEST onMuteMicAction mute=%d tips=%@ self=%@", mute, TTRTDesc(tips), NSStringFromClass([self class]));
-    if (gRTAntiMute && mute && !TTRTIsSelfAction()) { TTLog(@"ROOMTEST AntiMute BLOCK mute"); return; }
+    if (TTRTIsSelfAction()) { gRTUserMuteIntent = mute; TTLog(@"ROOMTEST userMuteIntent=%d", mute); }
+    if (gRTAntiMute && mute && !TTRTIsSelfAction() && !gRTUserMuteIntent) { TTLog(@"ROOMTEST AntiMute BLOCK mute"); return; }
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL, BOOL, id, id, id))orig)(self, _cmd, mute, tips, muteToast, unmuteToast); } @finally { TTRTOrigDone(self, _cmd, orig); } }
 }
@@ -421,7 +423,7 @@ static BOOL rt_shouldIgnoreMuteMic(id self, SEL _cmd, id arg) {
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { origVal = ((BOOL (*)(id, SEL, id))orig)(self, _cmd, arg); } @finally { TTRTOrigDone(self, _cmd, orig); } }
     TTLog(@"ROOMTEST shouldIgnoreMuteMic arg=%@ orig=%d antiMute=%d", TTRTDesc(arg), origVal, gRTAntiMute);
-    if (gRTAntiMute && !TTRTIsSelfAction()) return YES;
+    if (gRTAntiMute && !gRTUserMuteIntent) return YES;
     return origVal;
 }
 
@@ -534,14 +536,14 @@ static void rt_clearMessageWithTabidList(id self, SEL _cmd, id arg) {
 
 static void rt_setMicEnabled(id self, SEL _cmd, BOOL enabled) {
     TTLog(@"ROOMTEST setMicEnabled=%d self=%@ antiMute=%d ra:%p", enabled, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
-    if (gRTAntiMute && !enabled && !TTRTIsSelfAction() && !TTRTIsSelfDownMic()) { BOOL cur = YES; if ([self respondsToSelector:@selector(micEnabled)]) { cur = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(micEnabled)); } if (cur) { TTLog(@"ROOMTEST AntiMute BLOCK setMicEnabled=0"); return; } }
+    if (gRTAntiMute && !enabled && !gRTUserMuteIntent && !TTRTIsSelfDownMic()) { BOOL cur = YES; if ([self respondsToSelector:@selector(micEnabled)]) { cur = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(micEnabled)); } if (cur) { TTLog(@"ROOMTEST AntiMute BLOCK setMicEnabled=0"); return; } }
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, enabled); } @finally { TTRTOrigDone(self, _cmd, orig); } }
 }
 
 static void rt_setSilence(id self, SEL _cmd, BOOL silence) {
     TTLog(@"ROOMTEST setSilence=%d self=%@ antiMute=%d ra:%p", silence, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
-    if (gRTAntiMute && silence && !TTRTIsSelfAction() && !TTRTIsSelfDownMic()) { TTLog(@"ROOMTEST AntiMute BLOCK setSilence=1"); return; }
+    if (gRTAntiMute && silence && !gRTUserMuteIntent && !TTRTIsSelfDownMic()) { TTLog(@"ROOMTEST AntiMute BLOCK setSilence=1"); return; }
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, silence); } @finally { TTRTOrigDone(self, _cmd, orig); } }
 }
@@ -613,6 +615,7 @@ static void rt_muteThisMicHandle(id self, SEL _cmd, id arg) {
 static int rt_onButtonRequestDownMic(id self, SEL _cmd, id arg) {
     TTRTMarkSelfAction();
     gRTDownMicTs = [NSDate timeIntervalSinceReferenceDate];
+    gRTUserMuteIntent = YES;
     TTLog(@"ROOMTEST onButtonRequestDownMic arg=%@ self=%@ antiMute=%d", TTRTDesc(arg), NSStringFromClass([self class]), gRTAntiMute);
     IMP orig = TTRTOrig(self, _cmd);
     int r = 0;
@@ -623,21 +626,21 @@ static int rt_onButtonRequestDownMic(id self, SEL _cmd, id arg) {
 
 static void rt_enableMic(id self, SEL _cmd, BOOL enabled) {
     TTLog(@"ROOMTEST enableMic=%d self=%@ antiMute=%d ra:%p", enabled, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
-    if (gRTAntiMute && !enabled && !TTRTIsSelfAction() && !TTRTIsSelfDownMic()) { BOOL pub = YES; if ([self respondsToSelector:@selector(isPublishing)]) { pub = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isPublishing)); } if (pub) { TTLog(@"ROOMTEST AntiMute BLOCK enableMic=0"); return; } }
+    if (gRTAntiMute && !enabled && !gRTUserMuteIntent && !TTRTIsSelfDownMic()) { BOOL pub = YES; if ([self respondsToSelector:@selector(isPublishing)]) { pub = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isPublishing)); } if (pub) { TTLog(@"ROOMTEST AntiMute BLOCK enableMic=0"); return; } }
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, enabled); } @finally { TTRTOrigDone(self, _cmd, orig); } }
 }
 
 static void rt_setMute(id self, SEL _cmd, BOOL mute) {
     TTLog(@"ROOMTEST setMute=%d self=%@ antiMute=%d ra:%p", mute, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
-    if (gRTAntiMute && mute && !TTRTIsSelfAction() && !TTRTIsSelfDownMic()) { TTLog(@"ROOMTEST AntiMute BLOCK setMute=1"); return; }
+    if (gRTAntiMute && mute && !gRTUserMuteIntent && !TTRTIsSelfDownMic()) { TTLog(@"ROOMTEST AntiMute BLOCK setMute=1"); return; }
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, mute); } @finally { TTRTOrigDone(self, _cmd, orig); } }
 }
 
 static void rt_setAmISilent(id self, SEL _cmd, BOOL silent) {
     TTLog(@"ROOMTEST setAmISilent=%d self=%@ antiMute=%d ra:%p", silent, NSStringFromClass([self class]), gRTAntiMute, __builtin_return_address(0));
-    if (gRTAntiMute && silent && !TTRTIsSelfAction() && !TTRTIsSelfDownMic()) { TTLog(@"ROOMTEST AntiMute BLOCK setAmISilent=1"); return; }
+    if (gRTAntiMute && silent && !gRTUserMuteIntent && !TTRTIsSelfDownMic()) { TTLog(@"ROOMTEST AntiMute BLOCK setAmISilent=1"); return; }
     IMP orig = TTRTOrig(self, _cmd);
     if (orig) { @try { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, silent); } @finally { TTRTOrigDone(self, _cmd, orig); } }
 }
@@ -6182,7 +6185,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.42 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.43 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
