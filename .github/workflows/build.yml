@@ -16,12 +16,12 @@ jobs:
           clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaUIManager.m -o NovaUIManager.o
           clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaFloatingButton.m -o NovaFloatingButton.o
           clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -c -fobjc-arc NovaControlPanel.m -o NovaControlPanel.o
-          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -dynamiclib -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Security -undefined dynamic_lookup -o TTForge_NovaUI_v7.33.dylib TTForge.o NovaUIManager.o NovaFloatingButton.o NovaControlPanel.o
-          ls -lh TTForge_NovaUI_v7.33.dylib
-          file TTForge_NovaUI_v7.33.dylib || true
+          clang -arch arm64 -mios-version-min=14.0 -isysroot "$SDK" -dynamiclib -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Security -undefined dynamic_lookup -o TTForge_NovaUI_v7.34.dylib TTForge.o NovaUIManager.o NovaFloatingButton.o NovaControlPanel.o
+          ls -lh TTForge_NovaUI_v7.34.dylib
+          file TTForge_NovaUI_v7.34.dylib || true
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: TTForge-Nova-dylib
-          path: TTForge_NovaUI_v7.33.dylib
+          path: TTForge_NovaUI_v7.34.dylib
           if-no-files-found: error
