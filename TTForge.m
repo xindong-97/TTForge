@@ -4775,386 +4775,359 @@ static void TTPresentCustomIdAlert(dispatch_block_t reloadBlock) {
     [root presentViewController:ac animated:YES completion:nil];
 }
 
-static void TTPresentRTDressIdAlert(dispatch_block_t reloadBlock) {
-    UIWindow *mw = TTKeyWindow();
-    UIViewController *root = mw ? mw.rootViewController : nil;
-    while (root.presentedViewController) root = root.presentedViewController;
-    if (!root) return;
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"皮肤DressId"
-        message:@"填房间套装 DressId，0 表示只记录不替换"
-        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = gRTDressId ? [NSString stringWithFormat:@"%u", gRTDressId] : @"";
-        tf.placeholder = @"DressId";
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSString *t = ac.textFields.firstObject.text ?: @"";
-        gRTDressId = (uint32_t)[t intValue];
-        [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)gRTDressId forKey:@"ttforge.rtDressId"];
-        TTLog(@"状态设置 皮肤DressId → %u", gRTDressId);
-        if (reloadBlock) reloadBlock();
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [root presentViewController:ac animated:YES completion:nil];
-}
-
 static void TTRegisterNovaUIModules(void) {
     NovaUIManager *ui = [NovaUIManager sharedManager];
     ui.panelTitle = @"TTForge 控制中心";
-    ui.panelSubtitle = @"PLUGIN CONTROL CENTER  ·  v7.34";
 
-    [ui registerPickerModule:@"memberLevel"
-                       title:@"会员等级"
-                    subtitle:@"伪造 SVIP 会员等级与专属特权"
-                        icon:@"crown.fill"
-               valueProvider:^NSString *{ return TTMemberLevelName(); }
-             optionsProvider:^NSArray<NSDictionary *> *{
-                 NSArray *raw = @[
-                     @{@"t": @"原样（真实数据）", @"v": @0},
-                     @{@"t": @"SVIP 1", @"v": @1}, @{@"t": @"SVIP 2", @"v": @2},
-                     @{@"t": @"SVIP 3", @"v": @3}, @{@"t": @"SVIP 4", @"v": @4},
-                     @{@"t": @"SVIP 5", @"v": @5}, @{@"t": @"SVIP 6", @"v": @6},
-                     @{@"t": @"SVIP 7", @"v": @7}, @{@"t": @"SVIP 8（满级）", @"v": @8},
-                 ];
-                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:raw.count];
-                 for (NSDictionary *it in raw) {
-                     NSInteger v = [it[@"v"] integerValue];
-                     [opts addObject:@{@"title": it[@"t"], @"value": @(v), @"selected": @(v == gMemberLevel)}];
-                 }
-                 return opts;
-             }
-            selectionHandler:^(NSInteger index, id value) {
-                gMemberLevel = [value integerValue];
-                [[NSUserDefaults standardUserDefaults] setInteger:gMemberLevel forKey:@"ttforge.memberLevel"];
-                TTRestoreAndReforgeGPB();
-                TTLog(@"面板 会员等级 → %ld", (long)gMemberLevel);
-                TTApplyForgeStateNow(@"会员等级");
-            }];
+    {
+        NSArray *titles = @[@"原样（真实数据）", @"SVIP 1", @"SVIP 2", @"SVIP 3", @"SVIP 4", @"SVIP 5", @"SVIP 6", @"SVIP 7", @"SVIP 8（满级）"];
+        NSArray *values = @[@0, @1, @2, @3, @4, @5, @6, @7, @8];
+        NSInteger defIdx = 0;
+        for (NSUInteger i = 0; i < values.count; i++) {
+            if ([values[i] integerValue] == gMemberLevel) { defIdx = (NSInteger)i; break; }
+        }
+        [ui registerSelectInMenu:nil
+                             key:@"memberLevel"
+                           title:@"会员等级"
+                        subtitle:@"伪造 SVIP 会员等级与专属特权"
+                            icon:@"crown.fill"
+                         options:titles
+                    defaultIndex:defIdx
+                         handler:^(NSInteger selectedIndex, NSString *selectedOption) {
+                             if (selectedIndex < 0 || selectedIndex >= (NSInteger)values.count) return;
+                             gMemberLevel = [values[(NSUInteger)selectedIndex] integerValue];
+                             [[NSUserDefaults standardUserDefaults] setInteger:gMemberLevel forKey:@"ttforge.memberLevel"];
+                             TTRestoreAndReforgeGPB();
+                             TTLog(@"面板 会员等级 → %ld", (long)gMemberLevel);
+                             TTApplyForgeStateNow(@"会员等级");
+                         }];
+    }
 
-    [ui registerPickerModule:@"nobleLevel"
-                       title:@"贵族等级"
-                    subtitle:@"伪造贵族爵位、徽章、H5贵族中心与神秘人"
-                        icon:@"sparkles"
-               valueProvider:^NSString *{ return TTNobleLevelName(); }
-             optionsProvider:^NSArray<NSDictionary *> *{
-                 NSArray *raw = @[
-                     @{@"t": @"原样（真实数据）", @"v": @0},
-                     @{@"t": @"1级 · 少爵", @"v": @1}, @{@"t": @"2级 · 男爵", @"v": @2},
-                     @{@"t": @"3级 · 子爵", @"v": @3}, @{@"t": @"4级 · 伯爵", @"v": @4},
-                     @{@"t": @"5级 · 侯爵", @"v": @5}, @{@"t": @"6级 · 公爵", @"v": @6},
-                     @{@"t": @"7级 · 郡王", @"v": @7}, @{@"t": @"8级 · 亲王", @"v": @8},
-                     @{@"t": @"9级 · 国王", @"v": @9}, @{@"t": @"10级 · 神王（满级）", @"v": @10},
-                 ];
-                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:raw.count];
-                 for (NSDictionary *it in raw) {
-                     NSInteger v = [it[@"v"] integerValue];
-                     [opts addObject:@{@"title": it[@"t"], @"value": @(v), @"selected": @(v == gNobleLevel)}];
-                 }
-                 return opts;
-             }
-            selectionHandler:^(NSInteger index, id value) {
-                gNobleLevel = [value integerValue];
-                [[NSUserDefaults standardUserDefaults] setInteger:gNobleLevel forKey:@"ttforge.nobleLevel"];
-                TTRestoreAndReforgeGPB();
-                TTLog(@"面板 贵族等级 → %ld", (long)gNobleLevel);
-                TTApplyForgeStateNow(@"贵族等级");
-            }];
+    {
+        NSArray *titles = @[@"原样（真实数据）", @"1级 · 少爵", @"2级 · 男爵", @"3级 · 子爵", @"4级 · 伯爵", @"5级 · 侯爵", @"6级 · 公爵", @"7级 · 郡王", @"8级 · 亲王", @"9级 · 国王", @"10级 · 神王（满级）"];
+        NSArray *values = @[@0, @1, @2, @3, @4, @5, @6, @7, @8, @9, @10];
+        NSInteger defIdx = 0;
+        for (NSUInteger i = 0; i < values.count; i++) {
+            if ([values[i] integerValue] == gNobleLevel) { defIdx = (NSInteger)i; break; }
+        }
+        [ui registerSelectInMenu:nil
+                             key:@"nobleLevel"
+                           title:@"贵族等级"
+                        subtitle:@"伪造贵族爵位、徽章、H5贵族中心与神秘人"
+                            icon:@"sparkles"
+                         options:titles
+                    defaultIndex:defIdx
+                         handler:^(NSInteger selectedIndex, NSString *selectedOption) {
+                             if (selectedIndex < 0 || selectedIndex >= (NSInteger)values.count) return;
+                             gNobleLevel = [values[(NSUInteger)selectedIndex] integerValue];
+                             [[NSUserDefaults standardUserDefaults] setInteger:gNobleLevel forKey:@"ttforge.nobleLevel"];
+                             TTRestoreAndReforgeGPB();
+                             TTLog(@"面板 贵族等级 → %ld", (long)gNobleLevel);
+                             TTApplyForgeStateNow(@"贵族等级");
+                         }];
+    }
 
-    [ui registerPickerModule:@"nameStyle"
-                       title:@"名字样式"
-                    subtitle:@"聊天、麦位与主页昵称渐变炫彩样式"
-                        icon:@"paintbrush.fill"
-               valueProvider:^NSString *{ return TTNamePresetName(); }
-             optionsProvider:^NSArray<NSDictionary *> *{
-                 NSArray *presets = TTNamePresetList();
-                 NSString *nick = TTMyNickname();
-                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:presets.count];
-                 for (NSDictionary *pr in presets) {
-                     NSInteger ps = [pr[@"s"] integerValue], pcIdx = [pr[@"c"] integerValue];
-                     [opts addObject:@{
-                         @"title": pr[@"t"],
-                         @"attrTitle": TTNamePreviewAttr(nick, ps, pcIdx),
-                         @"value": pr,
-                         @"selected": @(ps == gNameStyle && pcIdx == gNameColorIndex)
-                     }];
-                 }
-                 return opts;
-             }
-            selectionHandler:^(NSInteger index, id value) {
-                if (![value isKindOfClass:[NSDictionary class]]) return;
-                NSDictionary *pr = (NSDictionary *)value;
-                gNameStyle = [pr[@"s"] integerValue];
-                gNameColorIndex = [pr[@"c"] integerValue];
-                NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-                [ud setInteger:gNameStyle forKey:@"ttforge.nameStyle"];
-                [ud setBool:(gNameStyle != 0) forKey:@"ttforge.nameColor"];
-                [ud setInteger:gNameColorIndex forKey:@"ttforge.nameColorIndex"];
-                TTLog(@"面板 名字样式 → %@", TTNamePresetName());
-                TTApplyForgeStateNow(@"名字样式");
-            }];
+    {
+        NSArray *presets = TTNamePresetList();
+        NSMutableArray *titles = [NSMutableArray arrayWithCapacity:presets.count];
+        NSInteger defIdx = 0;
+        for (NSUInteger i = 0; i < presets.count; i++) {
+            NSDictionary *pr = presets[i];
+            [titles addObject:pr[@"t"] ?: @""];
+            if ([pr[@"s"] integerValue] == gNameStyle && [pr[@"c"] integerValue] == gNameColorIndex) defIdx = (NSInteger)i;
+        }
+        [ui registerSelectInMenu:nil
+                             key:@"nameStyle"
+                           title:@"名字样式"
+                        subtitle:@"聊天、麦位与主页昵称渐变炫彩样式"
+                            icon:@"paintbrush.fill"
+                         options:titles
+                    defaultIndex:defIdx
+                         handler:^(NSInteger selectedIndex, NSString *selectedOption) {
+                             if (selectedIndex < 0 || selectedIndex >= (NSInteger)presets.count) return;
+                             NSDictionary *pr = presets[(NSUInteger)selectedIndex];
+                             gNameStyle = [pr[@"s"] integerValue];
+                             gNameColorIndex = [pr[@"c"] integerValue];
+                             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+                             [ud setInteger:gNameStyle forKey:@"ttforge.nameStyle"];
+                             [ud setBool:(gNameStyle != 0) forKey:@"ttforge.nameColor"];
+                             [ud setInteger:gNameColorIndex forKey:@"ttforge.nameColorIndex"];
+                             TTLog(@"面板 名字样式 → %@", TTNamePresetName());
+                             TTApplyForgeStateNow(@"名字样式");
+                         }];
+    }
 
-    [ui registerActionModule:@"customId"
+    [ui registerActionInMenu:nil
+                         key:@"customId"
                        title:@"显示ID"
                     subtitle:@"自定义本机主页与贵族中心显示的TT号"
                         icon:@"person.text.rectangle.fill"
-               valueProvider:^NSString *{ return gCustomId.length ? gCustomId : @"原样"; }
-               actionHandler:^(UIView *panelView, dispatch_block_t reloadBlock) {
-                   TTPresentCustomIdAlert(reloadBlock);
-               }];
+                 buttonTitle:@"设置"
+                     handler:^{
+                         TTPresentCustomIdAlert(nil);
+                     }];
 
-    [ui registerSwitchModule:@"blockReport"
+    [ui registerSwitchInMenu:nil
+                         key:@"blockReport"
                        title:@"访问隐身"
                     subtitle:@"访问他人主页不留访客记录与足迹"
                         icon:@"eye.slash.fill"
-               stateProvider:^BOOL{ return gBlockReport; }
+                defaultValue:gBlockReport
                      handler:^(BOOL enabled) {
                          gBlockReport = enabled;
                          [[NSUserDefaults standardUserDefaults] setBool:gBlockReport forKey:@"ttforge.blockReport"];
                          TTLog(@"状态设置 访问隐身 → %@", gBlockReport ? @"开" : @"关");
                      }];
 
-    [ui registerSwitchModule:@"sneakAll"
+    [ui registerSwitchInMenu:nil
+                         key:@"sneakAll"
                        title:@"悄悄看所有人"
                     subtitle:@"已读消息不发回执，悄悄查看会话"
                         icon:@"eye.fill"
-               stateProvider:^BOOL{ return gSneakAll; }
+                defaultValue:gSneakAll
                      handler:^(BOOL enabled) {
                          gSneakAll = enabled;
                          [[NSUserDefaults standardUserDefaults] setBool:gSneakAll forKey:@"ttforge.sneakAll"];
                          TTLog(@"状态设置 悄悄看所有人 → %@", gSneakAll ? @"开" : @"关");
                      }];
 
-    [ui registerPickerModule:@"charmLevel"
-                       title:@"魅力等级"
-                    subtitle:@"个人资料页魅力称号与等级展示"
-                        icon:@"heart.fill"
-               valueProvider:^NSString *{ return TTCharmLevelName(); }
-             optionsProvider:^NSArray<NSDictionary *> *{
-                 NSArray *raw = @[
-                     @{@"t": @"原样（真实数据）", @"v": @0},
-                     @{@"t": @"初见锋芒", @"v": @10}, @{@"t": @"见习偶像", @"v": @11},
-                     @{@"t": @"名声大振", @"v": @101}, @{@"t": @"人气之星", @"v": @1001},
-                     @{@"t": @"光辉夺目", @"v": @10001}, @{@"t": @"风华绝代", @"v": @100001},
-                     @{@"t": @"永恒璀璨", @"v": @1000001},
-                 ];
-                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:raw.count];
-                 for (NSDictionary *it in raw) {
-                     NSInteger v = [it[@"v"] integerValue];
-                     BOOL sel = (v == gCharmLevelVal) || (v > 0 && gCharmLevelVal > 0 && TTTitleBandForValue(v) == TTTitleBandForValue(gCharmLevelVal));
-                     [opts addObject:@{@"title": it[@"t"], @"value": @(v), @"selected": @(sel)}];
-                 }
-                 return opts;
-             }
-            selectionHandler:^(NSInteger index, id value) {
-                gCharmLevelVal = [value integerValue];
-                [[NSUserDefaults standardUserDefaults] setInteger:gCharmLevelVal forKey:@"ttforge.charmLevelVal"];
-                TTRestoreAndReforgeGPB();
-                TTLog(@"面板 魅力等级 → %ld", (long)gCharmLevelVal);
-                TTApplyForgeStateNow(@"魅力等级");
-            }];
+    {
+        NSArray *titles = @[@"原样（真实数据）", @"初见锋芒", @"见习偶像", @"名声大振", @"人气之星", @"光辉夺目", @"风华绝代", @"永恒璀璨"];
+        NSArray *values = @[@0, @10, @11, @101, @1001, @10001, @100001, @1000001];
+        NSInteger defIdx = 0;
+        for (NSUInteger i = 0; i < values.count; i++) {
+            NSInteger v = [values[i] integerValue];
+            if (v == gCharmLevelVal || (v > 0 && gCharmLevelVal > 0 && TTTitleBandForValue(v) == TTTitleBandForValue(gCharmLevelVal))) { defIdx = (NSInteger)i; break; }
+        }
+        [ui registerSelectInMenu:nil
+                             key:@"charmLevel"
+                           title:@"魅力等级"
+                        subtitle:@"个人资料页魅力称号与等级展示"
+                            icon:@"heart.fill"
+                         options:titles
+                    defaultIndex:defIdx
+                         handler:^(NSInteger selectedIndex, NSString *selectedOption) {
+                             if (selectedIndex < 0 || selectedIndex >= (NSInteger)values.count) return;
+                             gCharmLevelVal = [values[(NSUInteger)selectedIndex] integerValue];
+                             [[NSUserDefaults standardUserDefaults] setInteger:gCharmLevelVal forKey:@"ttforge.charmLevelVal"];
+                             TTRestoreAndReforgeGPB();
+                             TTLog(@"面板 魅力等级 → %ld", (long)gCharmLevelVal);
+                             TTApplyForgeStateNow(@"魅力等级");
+                         }];
+    }
 
-    [ui registerPickerModule:@"richLevel"
-                       title:@"财富等级"
-                    subtitle:@"个人资料页财富称号与等级展示"
-                        icon:@"bitcoinsign.circle.fill"
-               valueProvider:^NSString *{ return TTRichLevelName(); }
-             optionsProvider:^NSArray<NSDictionary *> *{
-                 NSArray *raw = @[
-                     @{@"t": @"原样（真实数据）", @"v": @0},
-                     @{@"t": @"优雅才子", @"v": @10}, @{@"t": @"圣殿绅士", @"v": @11},
-                     @{@"t": @"荣耀城主", @"v": @101}, @{@"t": @"尊贵诸侯", @"v": @1001},
-                     @{@"t": @"枭雄霸王", @"v": @10001}, @{@"t": @"至尊帝皇", @"v": @100001},
-                     @{@"t": @"永恒帝尊", @"v": @1000001},
-                 ];
-                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:raw.count];
-                 for (NSDictionary *it in raw) {
-                     NSInteger v = [it[@"v"] integerValue];
-                     BOOL sel = (v == gRichLevelVal) || (v > 0 && gRichLevelVal > 0 && TTTitleBandForValue(v) == TTTitleBandForValue(gRichLevelVal));
-                     [opts addObject:@{@"title": it[@"t"], @"value": @(v), @"selected": @(sel)}];
-                 }
-                 return opts;
-             }
-            selectionHandler:^(NSInteger index, id value) {
-                gRichLevelVal = [value integerValue];
-                [[NSUserDefaults standardUserDefaults] setInteger:gRichLevelVal forKey:@"ttforge.richLevelVal"];
-                TTRestoreAndReforgeGPB();
-                TTLog(@"面板 财富等级 → %ld", (long)gRichLevelVal);
-                TTApplyForgeStateNow(@"财富等级");
-            }];
+    {
+        NSArray *titles = @[@"原样（真实数据）", @"优雅才子", @"圣殿绅士", @"荣耀城主", @"尊贵诸侯", @"枭雄霸王", @"至尊帝皇", @"永恒帝尊"];
+        NSArray *values = @[@0, @10, @11, @101, @1001, @10001, @100001, @1000001];
+        NSInteger defIdx = 0;
+        for (NSUInteger i = 0; i < values.count; i++) {
+            NSInteger v = [values[i] integerValue];
+            if (v == gRichLevelVal || (v > 0 && gRichLevelVal > 0 && TTTitleBandForValue(v) == TTTitleBandForValue(gRichLevelVal))) { defIdx = (NSInteger)i; break; }
+        }
+        [ui registerSelectInMenu:nil
+                             key:@"richLevel"
+                           title:@"财富等级"
+                        subtitle:@"个人资料页财富称号与等级展示"
+                            icon:@"bitcoinsign.circle.fill"
+                         options:titles
+                    defaultIndex:defIdx
+                         handler:^(NSInteger selectedIndex, NSString *selectedOption) {
+                             if (selectedIndex < 0 || selectedIndex >= (NSInteger)values.count) return;
+                             gRichLevelVal = [values[(NSUInteger)selectedIndex] integerValue];
+                             [[NSUserDefaults standardUserDefaults] setInteger:gRichLevelVal forKey:@"ttforge.richLevelVal"];
+                             TTRestoreAndReforgeGPB();
+                             TTLog(@"面板 财富等级 → %ld", (long)gRichLevelVal);
+                             TTApplyForgeStateNow(@"财富等级");
+                         }];
+    }
 
-    [ui registerActionModule:@"uidLock"
+    [ui registerActionInMenu:nil
+                         key:@"uidLock"
                        title:@"账号锁定"
                     subtitle:@"点按轮换候选UID锁定"
                         icon:@"lock.shield.fill"
-               valueProvider:^NSString *{ return gSelfUid ? [NSString stringWithFormat:@"uid=%u", gSelfUid] : @"未锁定"; }
-               actionHandler:^(UIView *panelView, dispatch_block_t reloadBlock) {
-                   @try {
-                       NSArray *keys = nil;
-                       @synchronized (gHits) {
-                           keys = [[gHits keysSortedByValueUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-                               return [b[@"count"] compare:a[@"count"]];
-                           }] retain];
-                       }
-                       if (keys.count) {
-                           NSUInteger idx = 0;
-                           for (NSUInteger i = 0; i < keys.count; i++) {
-                               if ([keys[i] unsignedIntValue] == gSelfUid) { idx = (i + 1) % keys.count; break; }
-                           }
-                           gSelfUid = [keys[idx] unsignedIntValue];
-                           [[NSUserDefaults standardUserDefaults] setObject:@(gSelfUid) forKey:@"ttforge.selfUid"];
-                           TTLog(@"状态设置 账号锁定 → uid=%u %@（候选 %lu 个，点按轮换）", gSelfUid,
-                                 gHits[@(gSelfUid)][@"nickname"] ?: @"", (unsigned long)keys.count);
-                       } else {
-                           TTLog(@"状态设置 账号锁定：暂无候选（先浏览任意主页/资料页产生命中）");
-                       }
-                       [keys release];
-                   } @catch (id e) { TTLog(@"账号锁定异常 %@", e); }
-                   TTApplyForgeStateNow(@"账号锁定");
-                   if (reloadBlock) reloadBlock();
-               }];
+                 buttonTitle:@"轮换"
+                     handler:^{
+                         @try {
+                             NSArray *keys = nil;
+                             @synchronized (gHits) {
+                                 keys = [[gHits keysSortedByValueUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                                     return [b[@"count"] compare:a[@"count"]];
+                                 }] retain];
+                             }
+                             if (keys.count) {
+                                 NSUInteger idx = 0;
+                                 for (NSUInteger i = 0; i < keys.count; i++) {
+                                     if ([keys[i] unsignedIntValue] == gSelfUid) { idx = (i + 1) % keys.count; break; }
+                                 }
+                                 gSelfUid = [keys[idx] unsignedIntValue];
+                                 [[NSUserDefaults standardUserDefaults] setObject:@(gSelfUid) forKey:@"ttforge.selfUid"];
+                                 TTLog(@"状态设置 账号锁定 → uid=%u %@（候选 %lu 个，点按轮换）", gSelfUid,
+                                       gHits[@(gSelfUid)][@"nickname"] ?: @"", (unsigned long)keys.count);
+                             } else {
+                                 TTLog(@"状态设置 账号锁定：暂无候选（先浏览任意主页/资料页产生命中）");
+                             }
+                             [keys release];
+                         } @catch (id e) { TTLog(@"账号锁定异常 %@", e); }
+                         TTApplyForgeStateNow(@"账号锁定");
+                     }];
 
-    [ui registerActionModule:@"resetLock"
+    [ui registerActionInMenu:nil
+                         key:@"resetLock"
                        title:@"重置锁定"
                     subtitle:@"清除UID锁定与候选缓存并重新识别"
                         icon:@"arrow.counterclockwise"
-               valueProvider:^NSString *{ return @"重置"; }
-               actionHandler:^(UIView *panelView, dispatch_block_t reloadBlock) {
-                   gSelfUid = 0;
-                   @synchronized (gHits) { [gHits removeAllObjects]; }
-                   @synchronized (gForgedPlayers) { [gForgedPlayers removeAllObjects]; }
-                   [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ttforge.selfUid"];
-                   TTStrictSelfUid();
-                   TTLog(@"状态设置 重置锁定：已清 uid 锁定与候选（当前自动识别 uid=%u）", gSelfUid);
-                   if (reloadBlock) reloadBlock();
-               }];
+                 buttonTitle:@"重置"
+                     handler:^{
+                         gSelfUid = 0;
+                         @synchronized (gHits) { [gHits removeAllObjects]; }
+                         @synchronized (gForgedPlayers) { [gForgedPlayers removeAllObjects]; }
+                         [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ttforge.selfUid"];
+                         TTStrictSelfUid();
+                         TTLog(@"状态设置 重置锁定：已清 uid 锁定与候选（当前自动识别 uid=%u）", gSelfUid);
+                     }];
 
-    [ui registerSubmenuModule:@"logMenu"
-                        title:@"日志菜单"
-                     subtitle:@"H5抓取开关、运行日志导出与清空"
-                         icon:@"doc.text.magnifyingglass"
-                valueProvider:^NSString *{
-                    return gH5Capture ? [NSString stringWithFormat:@"抓取开 · %@", TTLogFileSizeText()] : TTLogFileSizeText();
-                }
-                itemsProvider:^NSArray<NSDictionary *> *{
-                    id sp = [^BOOL{ return gH5Capture; } copy];
-                    id sh = [^(BOOL enabled) {
-                        gH5Capture = enabled;
-                        [[NSUserDefaults standardUserDefaults] setBool:gH5Capture forKey:@"ttforge.h5capture"];
-                        TTLog(@"状态设置 H5抓取 → %@（K 层门控实时读取，即时生效）", gH5Capture ? @"开" : @"关");
-                    } copy];
-                    id expVal = [^NSString *{ return TTLogFileSizeText(); } copy];
-                    id expAct = [^(UIView *pv, dispatch_block_t rb) {
-                        [[NovaUIManager sharedManager] hidePanel];
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            TTExportLogFile();
-                        });
-                    } copy];
-                    id clrVal = [^NSString *{ return @"立即清空"; } copy];
-                    id clrAct = [^(UIView *pv, dispatch_block_t rb) {
-                        TTClearLogFile();
-                        if (rb) rb();
-                    } copy];
-                    NSArray *items = @[
-                        @{
-                            @"type": @"switch",
-                            @"key": @"h5capture",
-                            @"title": @"H5抓取",
-                            @"subtitle": @"捕获 H5 请求与响应报文写入日志",
-                            @"icon": @"network",
-                            @"stateProvider": [sp autorelease],
-                            @"handler": [sh autorelease]
-                        },
-                        @{
-                            @"type": @"action",
-                            @"key": @"exportLog",
-                            @"title": @"导出日志",
-                            @"subtitle": @"通过系统分享面板导出 ttforge.log",
-                            @"icon": @"square.and.arrow.up",
-                            @"valueProvider": [expVal autorelease],
-                            @"actionHandler": [expAct autorelease]
-                        },
-                        @{
-                            @"type": @"action",
-                            @"key": @"clearLog",
-                            @"title": @"清空日志",
-                            @"subtitle": @"删除本地日志文件并释放存储空间",
-                            @"icon": @"trash",
-                            @"valueProvider": [clrVal autorelease],
-                            @"actionHandler": [clrAct autorelease]
-                        }
-                    ];
-                    return items;
-                }];
+    [ui registerSubmenu:@"logMenu"
+                  title:@"日志菜单"
+               subtitle:@"H5抓取开关、运行日志导出与清空"
+                   icon:@"doc.text.magnifyingglass"];
 
-    [ui registerSubmenuModule:@"roomTest"
-                        title:@"房间测试"
-                     subtitle:@"防闭麦、防清屏、192k、皮肤、防踢、万能上麦、灵动岛"
-                         icon:@"mic.fill"
-                valueProvider:^NSString *{
-                    int n = (gRTAntiMute ? 1 : 0) + (gRTAntiClear ? 1 : 0) + (gRTAudio192 ? 1 : 0) + (gRTSkin ? 1 : 0) + (gRTAntiKick ? 1 : 0) + (gRTUpMic ? 1 : 0) + (gRTIsland ? 1 : 0);
-                    return n ? [NSString stringWithFormat:@"已开 %d 项", n] : @"全关";
-                }
-                itemsProvider:^NSArray<NSDictionary *> *{
-                    id muteSP = [^BOOL{ return gRTAntiMute; } copy];
-                    id muteSH = [^(BOOL enabled) {
-                        gRTAntiMute = enabled;
-                        [[NSUserDefaults standardUserDefaults] setBool:gRTAntiMute forKey:@"ttforge.rtAntiMute"];
-                        TTLog(@"状态设置 防闭麦 → %@", gRTAntiMute ? @"开" : @"关");
-                    } copy];
-                    id clearSP = [^BOOL{ return gRTAntiClear; } copy];
-                    id clearSH = [^(BOOL enabled) {
-                        gRTAntiClear = enabled;
-                        [[NSUserDefaults standardUserDefaults] setBool:gRTAntiClear forKey:@"ttforge.rtAntiClear"];
-                        TTLog(@"状态设置 防清屏 → %@", gRTAntiClear ? @"开" : @"关");
-                    } copy];
-                    id audioSP = [^BOOL{ return gRTAudio192; } copy];
-                    id audioSH = [^(BOOL enabled) {
-                        gRTAudio192 = enabled;
-                        [[NSUserDefaults standardUserDefaults] setBool:gRTAudio192 forKey:@"ttforge.rtAudio192"];
-                        TTLog(@"状态设置 192k音质 → %@", gRTAudio192 ? @"开" : @"关");
-                    } copy];
-                    id skinSP = [^BOOL{ return gRTSkin; } copy];
-                    id skinSH = [^(BOOL enabled) {
-                        gRTSkin = enabled;
-                        [[NSUserDefaults standardUserDefaults] setBool:gRTSkin forKey:@"ttforge.rtSkin"];
-                        TTLog(@"状态设置 皮肤DressId → %@", gRTSkin ? @"开" : @"关");
-                    } copy];
-                    id dressVal = [^NSString *{ return gRTDressId ? [NSString stringWithFormat:@"%u", gRTDressId] : @"0（只记录）"; } copy];
-                    id dressAct = [^(UIView *pv, dispatch_block_t rb) {
-                        TTPresentRTDressIdAlert(rb);
-                    } copy];
-                    id kickSP = [^BOOL{ return gRTAntiKick; } copy];
-                    id kickSH = [^(BOOL enabled) {
-                        gRTAntiKick = enabled;
-                        [[NSUserDefaults standardUserDefaults] setBool:gRTAntiKick forKey:@"ttforge.rtAntiKick"];
-                        TTLog(@"状态设置 防踢 → %@", gRTAntiKick ? @"开" : @"关");
-                    } copy];
-                    id upSP = [^BOOL{ return gRTUpMic; } copy];
-                    id upSH = [^(BOOL enabled) {
-                        gRTUpMic = enabled;
-                        [[NSUserDefaults standardUserDefaults] setBool:gRTUpMic forKey:@"ttforge.rtUpMic"];
-                        TTLog(@"状态设置 万能上麦 → %@", gRTUpMic ? @"开" : @"关");
-                    } copy];
-                    id islSP = [^BOOL{ return gRTIsland; } copy];
-                    id islSH = [^(BOOL enabled) {
-                        gRTIsland = enabled;
-                        [[NSUserDefaults standardUserDefaults] setBool:gRTIsland forKey:@"ttforge.rtIsland"];
-                        TTLog(@"状态设置 灵动岛记录 → %@", gRTIsland ? @"开" : @"关");
-                    } copy];
-                    NSArray *items = @[
-                        @{@"type": @"switch", @"key": @"rtAntiMute", @"title": @"防闭麦", @"subtitle": @"房主闭麦指令本地不执行", @"icon": @"mic.slash.fill", @"stateProvider": [muteSP autorelease], @"handler": [muteSH autorelease]},
-                        @{@"type": @"switch", @"key": @"rtAntiClear", @"title": @"防清屏", @"subtitle": @"清屏指令本地不执行，聊天记录保留", @"icon": @"text.bubble.fill", @"stateProvider": [clearSP autorelease], @"handler": [clearSH autorelease]},
-                        @{@"type": @"switch", @"key": @"rtAudio192", @"title": @"192k音质", @"subtitle": @"音频码率本地替换为 192000（测试值）", @"icon": @"waveform", @"stateProvider": [audioSP autorelease], @"handler": [audioSH autorelease]},
-                        @{@"type": @"switch", @"key": @"rtSkin", @"title": @"皮肤DressId", @"subtitle": @"房间套装更新时替换为填入的 DressId", @"icon": @"paintpalette.fill", @"stateProvider": [skinSP autorelease], @"handler": [skinSH autorelease]},
-                        @{@"type": @"action", @"key": @"rtDressId", @"title": @"皮肤DressId值", @"subtitle": @"填房间套装 DressId，0 表示只记录", @"icon": @"number", @"valueProvider": [dressVal autorelease], @"actionHandler": [dressAct autorelease]},
-                        @{@"type": @"switch", @"key": @"rtAntiKick", @"title": @"防踢", @"subtitle": @"踢出与踢下麦消息本地不执行", @"icon": @"hand.raised.fill", @"stateProvider": [kickSP autorelease], @"handler": [kickSH autorelease]},
-                        @{@"type": @"switch", @"key": @"rtUpMic", @"title": @"万能上麦", @"subtitle": @"上麦权限判断本地放行", @"icon": @"mic.fill", @"stateProvider": [upSP autorelease], @"handler": [upSH autorelease]},
-                        @{@"type": @"switch", @"key": @"rtIsland", @"title": @"灵动岛记录", @"subtitle": @"只记录灵动岛容器与注册调用", @"icon": @"bell.fill", @"stateProvider": [islSP autorelease], @"handler": [islSH autorelease]}
-                    ];
-                    return items;
-                }];
+    [ui registerSwitchInMenu:@"logMenu"
+                         key:@"h5capture"
+                       title:@"H5抓取"
+                    subtitle:@"捕获 H5 请求与响应报文写入日志"
+                        icon:@"network"
+                defaultValue:gH5Capture
+                     handler:^(BOOL enabled) {
+                         gH5Capture = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gH5Capture forKey:@"ttforge.h5capture"];
+                         TTLog(@"状态设置 H5抓取 → %@（K 层门控实时读取，即时生效）", gH5Capture ? @"开" : @"关");
+                     }];
+
+    [ui registerActionInMenu:@"logMenu"
+                         key:@"exportLog"
+                       title:@"导出日志"
+                    subtitle:@"通过系统分享面板导出 ttforge.log"
+                        icon:@"square.and.arrow.up"
+                 buttonTitle:@"导出"
+                     handler:^{
+                         [[NovaUIManager sharedManager] hidePanel];
+                         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                             TTExportLogFile();
+                         });
+                     }];
+
+    [ui registerActionInMenu:@"logMenu"
+                         key:@"clearLog"
+                       title:@"清空日志"
+                    subtitle:@"删除本地日志文件并释放存储空间"
+                        icon:@"trash"
+                 buttonTitle:@"清空"
+                     handler:^{
+                         TTClearLogFile();
+                     }];
+
+    [ui registerSubmenu:@"roomTest"
+                  title:@"房间测试"
+               subtitle:@"防闭麦、防清屏、192k、皮肤、防踢、万能上麦、灵动岛"
+                   icon:@"mic.fill"];
+
+    [ui registerSwitchInMenu:@"roomTest"
+                         key:@"rtAntiMute"
+                       title:@"防闭麦"
+                    subtitle:@"房主闭麦指令本地不执行"
+                        icon:@"mic.slash.fill"
+                defaultValue:gRTAntiMute
+                     handler:^(BOOL enabled) {
+                         gRTAntiMute = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gRTAntiMute forKey:@"ttforge.rtAntiMute"];
+                         TTLog(@"状态设置 防闭麦 → %@", gRTAntiMute ? @"开" : @"关");
+                     }];
+
+    [ui registerSwitchInMenu:@"roomTest"
+                         key:@"rtAntiClear"
+                       title:@"防清屏"
+                    subtitle:@"清屏指令本地不执行，聊天记录保留"
+                        icon:@"text.bubble.fill"
+                defaultValue:gRTAntiClear
+                     handler:^(BOOL enabled) {
+                         gRTAntiClear = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gRTAntiClear forKey:@"ttforge.rtAntiClear"];
+                         TTLog(@"状态设置 防清屏 → %@", gRTAntiClear ? @"开" : @"关");
+                     }];
+
+    [ui registerSwitchInMenu:@"roomTest"
+                         key:@"rtAudio192"
+                       title:@"192k音质"
+                    subtitle:@"音频码率本地替换为 192000（测试值）"
+                        icon:@"waveform"
+                defaultValue:gRTAudio192
+                     handler:^(BOOL enabled) {
+                         gRTAudio192 = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gRTAudio192 forKey:@"ttforge.rtAudio192"];
+                         TTLog(@"状态设置 192k音质 → %@", gRTAudio192 ? @"开" : @"关");
+                     }];
+
+    [ui registerSwitchInMenu:@"roomTest"
+                         key:@"rtSkin"
+                       title:@"皮肤DressId"
+                    subtitle:@"房间套装更新时替换为填入的 DressId"
+                        icon:@"paintpalette.fill"
+                defaultValue:gRTSkin
+                     handler:^(BOOL enabled) {
+                         gRTSkin = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gRTSkin forKey:@"ttforge.rtSkin"];
+                         TTLog(@"状态设置 皮肤DressId → %@", gRTSkin ? @"开" : @"关");
+                     }];
+
+    [ui registerInputInMenu:@"roomTest"
+                        key:@"rtDressId"
+                      title:@"皮肤DressId值"
+                   subtitle:@"填房间套装 DressId，0 表示只记录"
+                       icon:@"number"
+                placeholder:@"DressId"
+               defaultValue:gRTDressId ? [NSString stringWithFormat:@"%u", gRTDressId] : @""
+                    handler:^(NSString *text) {
+                        gRTDressId = (uint32_t)[text intValue];
+                        [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)gRTDressId forKey:@"ttforge.rtDressId"];
+                        TTLog(@"状态设置 皮肤DressId → %u", gRTDressId);
+                    }];
+
+    [ui registerSwitchInMenu:@"roomTest"
+                         key:@"rtAntiKick"
+                       title:@"防踢"
+                    subtitle:@"踢出与踢下麦消息本地不执行"
+                        icon:@"hand.raised.fill"
+                defaultValue:gRTAntiKick
+                     handler:^(BOOL enabled) {
+                         gRTAntiKick = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gRTAntiKick forKey:@"ttforge.rtAntiKick"];
+                         TTLog(@"状态设置 防踢 → %@", gRTAntiKick ? @"开" : @"关");
+                     }];
+
+    [ui registerSwitchInMenu:@"roomTest"
+                         key:@"rtUpMic"
+                       title:@"万能上麦"
+                    subtitle:@"上麦权限判断本地放行"
+                        icon:@"mic.fill"
+                defaultValue:gRTUpMic
+                     handler:^(BOOL enabled) {
+                         gRTUpMic = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gRTUpMic forKey:@"ttforge.rtUpMic"];
+                         TTLog(@"状态设置 万能上麦 → %@", gRTUpMic ? @"开" : @"关");
+                     }];
+
+    [ui registerSwitchInMenu:@"roomTest"
+                         key:@"rtIsland"
+                       title:@"灵动岛记录"
+                    subtitle:@"只记录灵动岛容器与注册调用"
+                        icon:@"bell.fill"
+                defaultValue:gRTIsland
+                     handler:^(BOOL enabled) {
+                         gRTIsland = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gRTIsland forKey:@"ttforge.rtIsland"];
+                         TTLog(@"状态设置 灵动岛记录 → %@", gRTIsland ? @"开" : @"关");
+                     }];
 
     [ui install];
 }
@@ -5941,7 +5914,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.31 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.35 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
