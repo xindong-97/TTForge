@@ -558,6 +558,14 @@ static id rt_decideChainNodesBeforeUpMic(id self, SEL _cmd) {
     return r;
 }
 
+
+static void rt_clearVoid(id self, SEL _cmd) {
+    TTLog(@"ROOMTEST %@ self=%@ antiClear=%d", NSStringFromSelector(_cmd), NSStringFromClass([self class]), gRTAntiClear);
+    if (gRTAntiClear) { TTLog(@"ROOMTEST AntiClear BLOCK %@", NSStringFromSelector(_cmd)); return; }
+    IMP orig = TTRTOrig([self class], _cmd);
+    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+}
+
 static void TTRTInstallHooks(void) {
     if (!gRTOrigImps) gRTOrigImps = [[NSMutableDictionary alloc] init];
     TTRTSwizzle(NSClassFromString(@"CommonRealTimeVoiceRoomViewController"), @selector(onMuteMicAction:tipsInView:muteToast:unmuteToast:), (IMP)rt_onMuteMicAction4);
@@ -608,6 +616,11 @@ static void TTRTInstallHooks(void) {
     TTRTSwizzle(NSClassFromString(@"RealTimeOfferRoomMicControl"), @selector(icanChangeToMicView:), (IMP)rt_icanChangeToMicView);
     TTRTSwizzle(NSClassFromString(@"RealTimeMicControl"), @selector(decideChainNodesBeforeUpMic), (IMP)rt_decideChainNodesBeforeUpMic);
     TTRTSwizzle(NSClassFromString(@"WeddingMicControl"), @selector(decideChainNodesBeforeUpMic), (IMP)rt_decideChainNodesBeforeUpMic);
+    TTRTSwizzle(NSClassFromString(@"RealTimeVoiceMessageControl"), @selector(clearAllMsgs), (IMP)rt_clearVoid);
+    TTRTSwizzle(NSClassFromString(@"RealTimeVoiceMessageControl"), @selector(clearGamingAllMsgs), (IMP)rt_clearVoid);
+    TTRTSwizzle(NSClassFromString(@"GameModeSingleScreen"), @selector(clearMsgs), (IMP)rt_clearVoid);
+    TTRTSwizzle(NSClassFromString(@"RealTimeFunMicControl"), @selector(clearGameMessageScreen), (IMP)rt_clearVoid);
+    TTRTSwizzle(NSClassFromString(@"CommonChannelService"), @selector(clearGameMessageWithTabidList:), (IMP)rt_clearMessageWithTabidList);
     TTLog(@"ROOMTEST hooks installed mute=%d clear=%d audio=%d skin=%d kick=%d upMic=%d island=%d dressId=%u", gRTAntiMute, gRTAntiClear, gRTAudio192, gRTSkin, gRTAntiKick, gRTUpMic, gRTIsland, gRTDressId);
 }
 
@@ -6020,7 +6033,7 @@ __attribute__((constructor)) static void TTForgeInit(void) {
                       TTSwizzle(utilCls, @selector(showHint:), (IMP)TTV_showHint, (IMP *)&origV_showHint);
             TTLog(@"V 层 TTUIUtil 提示拦截 error=%@ hint=%@", ie ? @"✓" : @"✗", ih ? @"✓" : @"✗");
         }
-        TTLog(@"TTForge v7.37 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
+        TTLog(@"TTForge v7.38 启动 层 A%@ B%@ C%@ D%@ R%@ N%@ W%@ H%@ E%@ K%@ M%@ G✗ U%@ H5抓取=%@ 会员=%@ 贵族=%@ 隐身=%@ 名字=%@ 气泡=#%u 背景=#%u 关心=#%u 房间=#%u",
               aOK ? @"✓" : @"✗", bOK ? @"✓" : @"✗", cOK ? @"✓" : @"✗", dOK ? @"✓" : @"✗",
               rOK ? @"✓" : @"✗", nOK ? @"✓" : @"✗", wOK ? @"✓" : @"✗", hOK ? @"✓" : @"✗",
               eOK ? @"✓" : @"✗", kOK ? @"✓" : @"✗", mOK ? @"✓" : @"✗",
