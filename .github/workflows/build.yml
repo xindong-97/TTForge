@@ -25,10 +25,10 @@ jobs:
           clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -fblocks -c NovaControlPanel.m -o out/NovaControlPanel.o
           clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -fblocks -c NovaFloatingButton.m -o out/NovaFloatingButton.o
           clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -fblocks -c NovaUIManager.m -o out/NovaUIManager.o
-          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -dynamiclib -fblocks -o out/TTForge_NovaUI_v7.35.dylib out/TTForge.o out/NovaControlPanel.o out/NovaFloatingButton.o out/NovaUIManager.o -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Security
-          file out/TTForge_NovaUI_v7.35.dylib
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -dynamiclib -fblocks -o out/TTForge_NovaUI_v7.36.dylib out/TTForge.o out/NovaControlPanel.o out/NovaFloatingButton.o out/NovaUIManager.o -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Security
+          file out/TTForge_NovaUI_v7.36.dylib
           ls -lh out/
       - uses: actions/upload-artifact@v4
         with:
           name: TTForge-Nova120-dylib
-          path: out/TTForge_NovaUI_v7.35.dylib
+          path: out/TTForge_NovaUI_v7.36.dylib
