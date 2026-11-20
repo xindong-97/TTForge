@@ -78,10 +78,14 @@ static inline id TTGetWeakCtx(NSString *k) {
 static inline void TTSetWeakCtx(NSString *k, id ctx) {
     if (!k) return;
     if (!gWeakCtxMap) gWeakCtxMap = [[NSMapTable strongToWeakObjectsMapTable] retain];
+    static BOOL inSet = NO;
+    if (inSet) return;
+    inSet = YES;
     @synchronized (gWeakCtxMap) {
         if (ctx) [gWeakCtxMap setObject:ctx forKey:k];
         else [gWeakCtxMap removeObjectForKey:k];
     }
+    inSet = NO;
 }
 static inline id TTGetLastSelfLayoutCtx(void)       { return TTGetWeakCtx(@"self"); }
 static inline void TTSetLastSelfLayoutCtx(id ctx)   { TTSetWeakCtx(@"self", ctx); }
@@ -4799,7 +4803,7 @@ static void TTPresentRTDressIdAlert(dispatch_block_t reloadBlock) {
 static void TTRegisterNovaUIModules(void) {
     NovaUIManager *ui = [NovaUIManager sharedManager];
     ui.panelTitle = @"TTForge 控制中心";
-    ui.panelSubtitle = @"PLUGIN CONTROL CENTER  ·  v7.33";
+    ui.panelSubtitle = @"PLUGIN CONTROL CENTER  ·  v7.34";
 
     [ui registerPickerModule:@"memberLevel"
                        title:@"会员等级"
@@ -5830,7 +5834,16 @@ __attribute__((constructor)) static void TTForgeInit(void) {
 
         {
             Class lcCls = NSClassFromString(@"PersonalDetailLayoutContext");
-            TTSwizzle(lcCls, @selector(init), (IMP)TTH_init, (IMP *)&origH_init);
+            {
+                Method initM = lcCls ? class_getInstanceMethod(lcCls, @selector(init)) : NULL;
+                if (initM) {
+                    origH_init = (id (*)(id, SEL))method_getImplementation(initM);
+                    if (!class_addMethod(lcCls, @selector(init), (IMP)TTH_init, method_getTypeEncoding(initM))) {
+                        method_setImplementation(initM, (IMP)TTH_init);
+                    }
+                    TTLog(@"H 层 init 安全钩子 PersonalDetailLayoutContext 子类独占 orig=%p", origH_init);
+                }
+            }
             TTSwizzle(lcCls, @selector(setIsMe:), (IMP)TTH_setIsMe, (IMP *)&origH_setIsMe);
             TTSwizzle(lcCls, @selector(isMe), (IMP)TTH_isMe, (IMP *)&origH_isMe);
             TTSwizzle(lcCls, @selector(IdView), (IMP)TTH_idView, (IMP *)&origH_idView);
