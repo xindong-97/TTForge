@@ -2,6 +2,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdlib.h>
+#import "NovaUIManager.h"
 
 static BOOL gBlockReport = NO;
 static BOOL gSneakAll = YES;
@@ -41,9 +42,6 @@ static NSString *gMyRealAccount = nil;
 static BOOL gLastPrivWasSelf = NO;
 static CFAbsoluteTime gLastOtherProfileTs = 0;
 static BOOL gActiveProfileIsOther = NO;
-static id gLastSelfLayoutCtx = nil;
-static id gLastOtherLayoutCtx = nil;
-static id gLatestLayoutCtx = nil;
 
 static NSMutableDictionary *gHits = nil;
 static NSHashTable *gForgedPlayers = nil;
@@ -69,6 +67,28 @@ static char kTTNobleUidKey;
 static char kTTSelfPrivKey;
 static char kTTRealAccKey;
 static char kTTCtxExplicitIsMeKey;
+static char kTTCountedUidKey;
+static char kTTTaggedNobleUidKey;
+
+static NSMapTable *gWeakCtxMap = nil;
+static inline id TTGetWeakCtx(NSString *k) {
+    if (!gWeakCtxMap || !k) return nil;
+    @synchronized (gWeakCtxMap) { return [gWeakCtxMap objectForKey:k]; }
+}
+static inline void TTSetWeakCtx(NSString *k, id ctx) {
+    if (!k) return;
+    if (!gWeakCtxMap) gWeakCtxMap = [[NSMapTable strongToWeakObjectsMapTable] retain];
+    @synchronized (gWeakCtxMap) {
+        if (ctx) [gWeakCtxMap setObject:ctx forKey:k];
+        else [gWeakCtxMap removeObjectForKey:k];
+    }
+}
+static inline id TTGetLastSelfLayoutCtx(void)       { return TTGetWeakCtx(@"self"); }
+static inline void TTSetLastSelfLayoutCtx(id ctx)   { TTSetWeakCtx(@"self", ctx); }
+static inline id TTGetLastOtherLayoutCtx(void)      { return TTGetWeakCtx(@"other"); }
+static inline void TTSetLastOtherLayoutCtx(id ctx)  { TTSetWeakCtx(@"other", ctx); }
+static inline id TTGetLatestLayoutCtx(void)         { return TTGetWeakCtx(@"latest"); }
+static inline void TTSetLatestLayoutCtx(id ctx)     { TTSetWeakCtx(@"latest", ctx); }
 static dispatch_queue_t gLogQueue = NULL;
 static NSFileHandle *gLogFileHandle = nil;
 
@@ -306,14 +326,6 @@ static BOOL TTSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *origOut) {
 static IMP TTOrigIMP(Class cls, SEL sel) {
     Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
     return m ? method_getImplementation(m) : NULL;
-}
-
-static BOOL TTIsIgnoredHookClass(Class cls) {
-    NSString *nm = cls ? NSStringFromClass(cls) : nil;
-    if (!nm) return YES;
-    return ([nm rangeOfString:@"Protect"].location != NSNotFound ||
-            [nm rangeOfString:@"BUInterface"].location != NSNotFound ||
-            [nm hasPrefix:@"ABU"] || [nm hasPrefix:@"CSJ"]);
 }
 
 static NSString *TTRTKey(Class cls, SEL sel) {
@@ -594,7 +606,7 @@ static uint32_t TTUidForAccount(NSString *acc) {
         }
         if (n && n.unsignedIntValue > 0) return n.unsignedIntValue;
         NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
-        if ([[NSCharacterSet characterSetWithCharactersInString:acc] isSubsetOfSet:digits]) {
+        if ([digits isSupersetOfSet:[NSCharacterSet characterSetWithCharactersInString:acc]]) {
             uint32_t cand = (uint32_t)[acc longLongValue];
             if (cand > 0 && cs && [cs respondsToSelector:@selector(contactForUid:)]) {
                 id c2 = ((id (*)(id, SEL, uint32_t))objc_msgSend)(cs, @selector(contactForUid:), cand);
@@ -762,9 +774,15 @@ static id TTSuperPlayerDefaultMgr(void) {
         ? ((id (*)(id, SEL))objc_msgSend)((id)mc, @selector(defaultManager)) : nil;
 }
 
+static id (*origCM_mePlayer)(id, SEL);
+
 static id TTCMePlayer(void) {
     @try {
-        return TTGetObj(TTSuperPlayerDefaultMgr(), @selector(mePlayer));
+        id mgr = TTSuperPlayerDefaultMgr();
+        if (!mgr) return nil;
+        id p = origCM_mePlayer ? origCM_mePlayer(mgr, @selector(mePlayer)) : TTGetObj(mgr, @selector(mePlayer));
+        if (p) TTRegisterForgedPlayer(p);
+        return p;
     } @catch (id e) { return nil; }
 }
 
@@ -780,15 +798,22 @@ static uint32_t TTPlayerUidOf(id player) {
 }
 
 static uint32_t TTStrictSelfUid(void) {
-    id me = TTCMePlayer();
-    if (me) {
-        uint32_t u = TTGetU32(me, @selector(userId));
-        if (!u) u = TTGetU32(me, @selector(uid));
-        if (u > 0 && gSelfUid != u) {
-            gSelfUid = u;
-            [[NSUserDefaults standardUserDefaults] setObject:@(u) forKey:@"ttforge.selfUid"];
+    if (gSelfUid > 0) return gSelfUid;
+    NSMutableDictionary *ttd = [[NSThread currentThread] threadDictionary];
+    if ([ttd objectForKey:@"ttforge.inStrictUid"]) return gSelfUid;
+    [ttd setObject:@YES forKey:@"ttforge.inStrictUid"];
+    @try {
+        id me = TTCMePlayer();
+        if (me) {
+            uint32_t u = TTGetU32(me, @selector(userId));
+            if (!u) u = TTGetU32(me, @selector(uid));
+            if (u > 0 && gSelfUid != u) {
+                gSelfUid = u;
+                [[NSUserDefaults standardUserDefaults] setObject:@(u) forKey:@"ttforge.selfUid"];
+            }
         }
-    }
+    } @catch (id e) {}
+    [ttd removeObjectForKey:@"ttforge.inStrictUid"];
     return gSelfUid;
 }
 
@@ -859,11 +884,17 @@ static void TTACount(id obj) {
     if (!obj || !origA_uid) return;
     @try {
         uint32_t u = TTAUid(obj);
+        if (!u) return;
+        NSNumber *counted = objc_getAssociatedObject(obj, &kTTCountedUidKey);
+        if (counted && counted.unsignedIntValue == u) return;
         NSString *n = origA_nickname ? origA_nickname(obj, @selector(nickname)) : nil;
         NSString *a = objc_getAssociatedObject(obj, &kTTRealAccKey) ?: (origA_account ? origA_account(obj, @selector(account)) : nil);
         if ([a isKindOfClass:[NSString class]] && a.length && !objc_getAssociatedObject(obj, &kTTRealAccKey)) {
             if (!gCustomId.length || ![a isEqualToString:gCustomId])
                 objc_setAssociatedObject(obj, &kTTRealAccKey, a, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        }
+        if (n.length && a.length) {
+            objc_setAssociatedObject(obj, &kTTCountedUidKey, @(u), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         TTCountHit(u, n, a);
     } @catch (id e) {}
@@ -873,6 +904,7 @@ static BOOL TTAIsSelfRaw(id obj) {
     if (!obj) return NO;
     uint32_t u = TTAUid(obj);
     if (u > 0) return TTIsSelfUidRaw(u);
+    if (gSelfUid > 0) return NO;
     NSString *a = objc_getAssociatedObject(obj, &kTTRealAccKey) ?: (origA_account ? origA_account(obj, @selector(account)) : nil);
     return TTAccountMatchesMyReal(a);
 }
@@ -966,7 +998,7 @@ static id TTA_nickname(id self, SEL _cmd) {
 static id TTA_account(id self, SEL _cmd) {
     id v = origA_account(self, _cmd);
     TTACount(self);
-    return (gCustomId.length && TTAIsSelfRaw(self)) ? gCustomId : v;
+    return v;
 }
 
 static uint32_t (*origB_uid)(id, SEL);
@@ -987,11 +1019,17 @@ static void TTBCount(id obj) {
     if (!obj || !origB_uid) return;
     @try {
         uint32_t u = TTBUid(obj);
+        if (!u) return;
+        NSNumber *counted = objc_getAssociatedObject(obj, &kTTCountedUidKey);
+        if (counted && counted.unsignedIntValue == u) return;
         NSString *n = origB_nickName ? origB_nickName(obj, @selector(nickName)) : nil;
         NSString *a = objc_getAssociatedObject(obj, &kTTRealAccKey) ?: (origB_account ? origB_account(obj, @selector(account)) : nil);
         if ([a isKindOfClass:[NSString class]] && a.length && !objc_getAssociatedObject(obj, &kTTRealAccKey)) {
             if (!gCustomId.length || ![a isEqualToString:gCustomId])
                 objc_setAssociatedObject(obj, &kTTRealAccKey, a, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        }
+        if (n.length && a.length) {
+            objc_setAssociatedObject(obj, &kTTCountedUidKey, @(u), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         TTCountHit(u, n, a);
     } @catch (id e) {}
@@ -1001,6 +1039,7 @@ static BOOL TTBIsSelfRaw(id obj) {
     if (!obj) return NO;
     uint32_t u = TTBUid(obj);
     if (u > 0) return TTIsSelfUidRaw(u);
+    if (gSelfUid > 0) return NO;
     NSString *a = objc_getAssociatedObject(obj, &kTTRealAccKey) ?: (origB_account ? origB_account(obj, @selector(account)) : nil);
     return TTAccountMatchesMyReal(a);
 }
@@ -1012,7 +1051,7 @@ static BOOL TTBIsSelf(id obj) {
 static id TTB_account(id self, SEL _cmd) {
     id v = origB_account(self, _cmd);
     TTBCount(self);
-    return (gCustomId.length && TTBIsSelfRaw(self)) ? gCustomId : v;
+    return v;
 }
 
 static id TTB_displayAccount(id self, SEL _cmd) {
@@ -1022,14 +1061,12 @@ static id TTB_displayAccount(id self, SEL _cmd) {
 }
 
 static id TTB_ttAvatarAccount(id self, SEL _cmd) {
-    NSString *realAcc = objc_getAssociatedObject(self, &kTTRealAccKey);
-    if (realAcc.length && TTBIsSelfRaw(self) && gCustomId.length) {
-        TTSetObj(self, @selector(setAccount:), realAcc);
-        id v = origB_ttAvatarAccount ? origB_ttAvatarAccount(self, _cmd) : realAcc;
-        TTSetObj(self, @selector(setAccount:), gCustomId);
-        return v;
+    id v = origB_ttAvatarAccount ? origB_ttAvatarAccount(self, _cmd) : nil;
+    if ([v isKindOfClass:[NSString class]] && gCustomId.length && [(NSString *)v isEqualToString:gCustomId]) {
+        NSString *realAcc = objc_getAssociatedObject(self, &kTTRealAccKey) ?: gMyRealAccount;
+        if (realAcc.length) return realAcc;
     }
-    return origB_ttAvatarAccount ? origB_ttAvatarAccount(self, _cmd) : nil;
+    return v;
 }
 
 static int32_t TTB_vipLevel(id self, SEL _cmd) {
@@ -1114,7 +1151,6 @@ static BOOL (*origCM_isMySuperPlayerActive)(id, SEL);
 static BOOL (*origCM_hasPrivilege)(id, SEL, int64_t);
 static BOOL (*origCM_isWhiteUid)(id, SEL, uint32_t);
 static id (*origCM_playerForUid)(id, SEL, uint32_t);
-static id (*origCM_mePlayer)(id, SEL);
 
 static BOOL TTCIsMe(id player) {
     if (!player) return NO;
@@ -1133,8 +1169,12 @@ static BOOL TTCIsMe(id player) {
 
 static BOOL TTPlayerIsSelfRaw(id player) {
     if (!player) return NO;
+    if (TTIsForgedPlayer(player)) return YES;
     uint32_t u = TTPlayerUidOf(player);
-    if (TTCIsMe(player) || TTIsSelfUidRaw(u)) return YES;
+    if (u > 0 && gSelfUid > 0) return u == gSelfUid;
+    if (TTCIsMe(player)) return YES;
+    if (u > 0) return TTIsSelfUidRaw(u);
+    if (gSelfUid > 0) return NO;
     NSString *a = objc_getAssociatedObject(player, &kTTRealAccKey);
     return TTAccountMatchesMyReal(a);
 }
@@ -1245,8 +1285,10 @@ static id TTC_getAccount(id self, SEL _cmd) {
         if ([v isKindOfClass:[NSString class]] && [v length] && (!gCustomId.length || ![v isEqualToString:gCustomId])) {
             objc_setAssociatedObject(self, &kTTRealAccKey, v, OBJC_ASSOCIATION_COPY_NONATOMIC);
             TTCaptureMyRealAccount(v, TTStrictSelfUid());
+        } else if ([v isKindOfClass:[NSString class]] && gCustomId.length && [v isEqualToString:gCustomId]) {
+            NSString *realAcc = objc_getAssociatedObject(self, &kTTRealAccKey) ?: gMyRealAccount;
+            if (realAcc.length) return realAcc;
         }
-        if (gCustomId.length) return gCustomId;
     }
     return v;
 }
@@ -1257,8 +1299,10 @@ static id TTC_account(id self, SEL _cmd) {
         if ([v isKindOfClass:[NSString class]] && [v length] && (!gCustomId.length || ![v isEqualToString:gCustomId])) {
             objc_setAssociatedObject(self, &kTTRealAccKey, v, OBJC_ASSOCIATION_COPY_NONATOMIC);
             TTCaptureMyRealAccount(v, TTStrictSelfUid());
+        } else if ([v isKindOfClass:[NSString class]] && gCustomId.length && [v isEqualToString:gCustomId]) {
+            NSString *realAcc = objc_getAssociatedObject(self, &kTTRealAccKey) ?: gMyRealAccount;
+            if (realAcc.length) return realAcc;
         }
-        if (gCustomId.length) return gCustomId;
     }
     return v;
 }
@@ -1272,21 +1316,26 @@ static BOOL TTCIsMyLevel(id lvl) {
     if (!lvl || !TTMemberForgeOn()) return NO;
     if ([objc_getAssociatedObject(lvl, &kTTMyLevelObjKey) boolValue]) return YES;
     if (!origC_getSuperPlayerLevel) return NO;
+    NSMutableDictionary *ttd = [[NSThread currentThread] threadDictionary];
+    if ([ttd objectForKey:@"ttforge.inIsMyLevel"]) return NO;
+    [ttd setObject:@YES forKey:@"ttforge.inIsMyLevel"];
+    BOOL match = NO;
     @try {
         id me = TTCMePlayer();
-        if (me && origC_getSuperPlayerLevel(me, @selector(getSuperPlayerLevel)) == lvl) return YES;
-        if (origCM_playerForUid && TTStrictSelfUid()) {
-            id mgr = TTSuperPlayerDefaultMgr();
-            id p = mgr ? origCM_playerForUid(mgr, @selector(playerForUid:), TTStrictSelfUid()) : nil;
-            if (p && origC_getSuperPlayerLevel(p, @selector(getSuperPlayerLevel)) == lvl) return YES;
-        }
-        @synchronized (gForgedPlayers) {
-            for (id p in gForgedPlayers) {
-                if (origC_getSuperPlayerLevel(p, @selector(getSuperPlayerLevel)) == lvl) return YES;
+        if (me && origC_getSuperPlayerLevel(me, @selector(getSuperPlayerLevel)) == lvl) match = YES;
+        if (!match && gForgedPlayers) {
+            @synchronized (gForgedPlayers) {
+                for (id p in gForgedPlayers) {
+                    if (origC_getSuperPlayerLevel(p, @selector(getSuperPlayerLevel)) == lvl) { match = YES; break; }
+                }
             }
         }
+        if (match) {
+            objc_setAssociatedObject(lvl, &kTTMyLevelObjKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
     } @catch (id e) {}
-    return NO;
+    [ttd removeObjectForKey:@"ttforge.inIsMyLevel"];
+    return match;
 }
 
 static id TTC_getLevelIcon(id self, SEL _cmd, BOOL needNoOpen) {
@@ -1446,7 +1495,11 @@ static id TTCM_playerForUid(id self, SEL _cmd, uint32_t uid) {
     id p = origCM_playerForUid(self, _cmd, uid);
     if (p && uid > 0) {
         if (TTIsSelfUidRaw(uid)) TTRegisterForgedPlayer(p);
-        TTTagNobilityInfoOnObject(p, uid);
+        NSNumber *tagged = objc_getAssociatedObject(p, &kTTTaggedNobleUidKey);
+        if (!tagged || tagged.unsignedIntValue != uid) {
+            objc_setAssociatedObject(p, &kTTTaggedNobleUidKey, @(uid), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            TTTagNobilityInfoOnObject(p, uid);
+        }
     }
     return p;
 }
@@ -1456,7 +1509,17 @@ static id TTCM_mePlayer(id self, SEL _cmd) {
     if (p) {
         TTRegisterForgedPlayer(p);
         uint32_t u = TTPlayerUidOf(p) ?: gSelfUid;
-        if (u > 0) TTTagNobilityInfoOnObject(p, u);
+        if (u > 0) {
+            if (gSelfUid != u) {
+                gSelfUid = u;
+                [[NSUserDefaults standardUserDefaults] setObject:@(u) forKey:@"ttforge.selfUid"];
+            }
+            NSNumber *tagged = objc_getAssociatedObject(p, &kTTTaggedNobleUidKey);
+            if (!tagged || tagged.unsignedIntValue != u) {
+                objc_setAssociatedObject(p, &kTTTaggedNobleUidKey, @(u), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                TTTagNobilityInfoOnObject(p, u);
+            }
+        }
     }
     return p;
 }
@@ -1606,7 +1669,7 @@ static void TTR_syncInfo(id self, SEL _cmd, id pb, BOOL needCheck) {
         if (!puid) puid = TTPlayerUidOf(self);
         NSString *origAcc = pb ? (objc_getAssociatedObject(pb, &kTTRealAccKey) ?: TTGetObj(pb, @selector(account))) : nil;
         if (!puid && [origAcc isKindOfClass:[NSString class]] && origAcc.length) {
-            if (TTAccountMatchesMyReal(origAcc)) puid = TTStrictSelfUid();
+            if (gSelfUid == 0 && TTAccountMatchesMyReal(origAcc)) puid = TTStrictSelfUid();
             else puid = TTUidForAccount(origAcc);
         }
         isSelf = TTIsSelfUidRaw(puid) || TTPlayerIsSelfRaw(self);
@@ -1617,12 +1680,8 @@ static void TTR_syncInfo(id self, SEL _cmd, id pb, BOOL needCheck) {
                 if (!gCustomId.length || ![origAcc isEqualToString:gCustomId]) {
                     objc_setAssociatedObject(pb, &kTTRealAccKey, origAcc, OBJC_ASSOCIATION_COPY_NONATOMIC);
                     objc_setAssociatedObject(self, &kTTRealAccKey, origAcc, OBJC_ASSOCIATION_COPY_NONATOMIC);
+                    TTCaptureMyRealAccount(origAcc, puid);
                 }
-                TTCaptureMyRealAccount(origAcc, puid);
-            }
-            if (gCustomId.length && [pb respondsToSelector:@selector(setAccount:)]) {
-                TTSnapObj(pb, @"account", @selector(account));
-                TTSetObj(pb, @selector(setAccount:), gCustomId);
             }
             if (TTMemberForgeOn()) {
                 TTForgeSPLevel(pb);
@@ -1645,8 +1704,6 @@ static void TTR_syncInfo(id self, SEL _cmd, id pb, BOOL needCheck) {
         }
         if (puid > 0) TTTagNobilityInfoOnObject(self, puid);
         if (isSelf) {
-            TTSnapObj(self, @"account", @selector(account));
-            if (gCustomId.length) TTSetObj(self, @selector(setAccount:), gCustomId);
             if (origC_getSuperPlayerLevel) {
                 id lvl = origC_getSuperPlayerLevel(self, @selector(getSuperPlayerLevel));
                 if (lvl) TTSyncMyLevelObject(lvl);
@@ -1681,10 +1738,6 @@ static void TTForgeGrowGPB(id grow, uint32_t uidForGate) {
 
 static void TTForgeUGC(id pb) {
     TTACount(pb);
-    TTSnapObj(pb, @"account", @selector(account));
-    if (gCustomId.length) {
-        TTSetObj(pb, @selector(setAccount:), gCustomId);
-    }
     if (TTMemberForgeOn()) {
         TTSnapU(pb, @"vipLevel", @selector(vipLevel));
         TTSetU32(pb, @selector(setVipLevel:), (uint32_t)MIN(gMemberLevel, 8));
@@ -1698,18 +1751,44 @@ static void TTForgeUGC(id pb) {
     }
 }
 
+static BOOL TTIvarTypeMatchesAny(const char *type, const char *name, NSArray *tokens) {
+    if (!type || type[0] != '@') return NO;
+    NSString *ts = (type[1] == '"') ? [NSString stringWithUTF8String:type] : nil;
+    NSString *ns = name ? [NSString stringWithUTF8String:name] : nil;
+    for (NSString *tk in tokens) {
+        if (ts && [ts rangeOfString:tk options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+        if (!ts && ns && [ns rangeOfString:tk options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
 static void TTTagNobilityInfoOnObject(id obj, uint32_t u) {
     if (!obj || !u) return;
     @try {
         BOOL isSelf = TTIsSelfUidRaw(u);
-        for (NSString *selName in @[@"nobilityInfo", @"nobleInfo"]) {
-            SEL sel = NSSelectorFromString(selName);
-            if ([obj respondsToSelector:sel]) {
-                id ni = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
-                if (ni && !TTIsDefaultInstance(ni)) {
-                    objc_setAssociatedObject(ni, &kTTNobleUidKey, @(u), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                    if (isSelf && TTNobleForgeOn() && [NSStringFromClass([ni class]) rangeOfString:@"NobilityInfo"].location != NSNotFound)
-                        TTForgeNobilityInfo(ni);
+        NSString *ocn = NSStringFromClass([obj class]);
+        if ([ocn isEqualToString:@"UserUGCInfo"]) {
+            id ni = origA_nobleInfo ? origA_nobleInfo(obj, @selector(nobleInfo)) : nil;
+            if (ni && !TTIsDefaultInstance(ni)) {
+                objc_setAssociatedObject(ni, &kTTNobleUidKey, @(u), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        } else if ([ocn isEqualToString:@"TTUGCUserInfo"]) {
+            id ni = origB_nobilityInfo ? origB_nobilityInfo(obj, @selector(nobilityInfo)) : nil;
+            if (ni && !TTIsDefaultInstance(ni)) {
+                objc_setAssociatedObject(ni, &kTTNobleUidKey, @(u), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (isSelf && TTNobleForgeOn() && [NSStringFromClass([ni class]) rangeOfString:@"NobilityInfo"].location != NSNotFound)
+                    TTForgeNobilityInfo(ni);
+            }
+        } else if (![ocn isEqualToString:@"TTSuperPlayer"]) {
+            for (NSString *selName in @[@"nobilityInfo", @"nobleInfo"]) {
+                SEL sel = NSSelectorFromString(selName);
+                if ([obj respondsToSelector:sel]) {
+                    id ni = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+                    if (ni && !TTIsDefaultInstance(ni)) {
+                        objc_setAssociatedObject(ni, &kTTNobleUidKey, @(u), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                        if (isSelf && TTNobleForgeOn() && [NSStringFromClass([ni class]) rangeOfString:@"NobilityInfo"].location != NSNotFound)
+                            TTForgeNobilityInfo(ni);
+                    }
                 }
             }
         }
@@ -1720,7 +1799,8 @@ static void TTTagNobilityInfoOnObject(id obj, uint32_t u) {
             if (!ivars) continue;
             for (unsigned int i = 0; i < count; i++) {
                 const char *type = ivar_getTypeEncoding(ivars[i]);
-                if (!type || type[0] != '@') continue;
+                const char *name = ivar_getName(ivars[i]);
+                if (!TTIvarTypeMatchesAny(type, name, @[@"NobilityInfo", @"UserUGCInfo_Nobles", @"NobilityPrivilege", @"nobility", @"noble"])) continue;
                 id val = object_getIvar(obj, ivars[i]);
                 if (!val || TTIsDefaultInstance(val)) continue;
                 NSString *vcn = NSStringFromClass([val class]);
@@ -1748,7 +1828,8 @@ static BOOL TTObjectOwnsNobilityInfo(id holder, id targetInfo, int depth) {
             if (!ivars) continue;
             for (unsigned int i = 0; i < count; i++) {
                 const char *type = ivar_getTypeEncoding(ivars[i]);
-                if (!type || type[0] != '@') continue;
+                const char *name = ivar_getName(ivars[i]);
+                if (!TTIvarTypeMatchesAny(type, name, @[@"NobilityInfo", @"UserUGCInfo_Nobles", @"UGCUserInfo", @"SuperPlayer", @"nobility", @"noble"])) continue;
                 id val = object_getIvar(holder, ivars[i]);
                 if (!val) continue;
                 if (val == targetInfo) { free(ivars); return YES; }
@@ -1766,6 +1847,8 @@ static BOOL TTObjectOwnsNobilityInfo(id holder, id targetInfo, int depth) {
 
 static BOOL TTIsMePlayerNobilityInfo(id info) {
     if (!info || TTIsDefaultInstance(info)) return NO;
+    NSNumber *ownerUid = objc_getAssociatedObject(info, &kTTNobleUidKey);
+    if (ownerUid != nil) return TTIsSelfUidRaw(ownerUid.unsignedIntValue);
     id me = TTCMePlayer();
     if (me && TTObjectOwnsNobilityInfo(me, info, 0)) return YES;
     if (gForgedPlayers) {
@@ -1792,7 +1875,7 @@ static id TTR_initWithPb(id self, SEL _cmd, id pb) {
             }
             TTCountHit(u, n, realAcc);
             TTRecordAccountUid(realAcc, u);
-            if (TTIsSelfUidRaw(u) || (u == 0 && TTAccountMatchesMyReal(realAcc))) {
+            if (TTIsSelfUidRaw(u) || (u == 0 && gSelfUid == 0 && TTAccountMatchesMyReal(realAcc))) {
                 TTForgeUGC(pb);
                 selfPb = YES;
             } else if (u > 0) {
@@ -1812,10 +1895,6 @@ static id TTR_initWithPb(id self, SEL _cmd, id pb) {
                 objc_setAssociatedObject(r, &kTTRealAccKey, realAcc, OBJC_ASSOCIATION_COPY_NONATOMIC);
             }
             if (u > 0) TTTagNobilityInfoOnObject(r, u);
-            if (selfPb) {
-                TTSnapObj(r, @"account", @selector(account));
-                if (gCustomId.length) TTSetObj(r, @selector(setAccount:), gCustomId);
-            }
         } @catch (id e) {}
     }
     return r;
@@ -1849,9 +1928,10 @@ static BOOL TTLayoutContextHasVisibleView(id ctx) {
 
 static BOOL TTIsOtherUserProfileVisible(void) {
     @try {
-        if (gLastOtherLayoutCtx) {
-            BOOL isMe = origH_isMe ? origH_isMe(gLastOtherLayoutCtx, @selector(isMe)) : TTGetBool(gLastOtherLayoutCtx, @selector(isMe));
-            if (!isMe && TTLayoutContextHasVisibleView(gLastOtherLayoutCtx)) return YES;
+        id otherCtx = TTGetLastOtherLayoutCtx();
+        if (otherCtx) {
+            BOOL isMe = origH_isMe ? origH_isMe(otherCtx, @selector(isMe)) : TTGetBool(otherCtx, @selector(isMe));
+            if (!isMe && TTLayoutContextHasVisibleView(otherCtx)) return YES;
         }
         if (gActiveProfileIsOther && (CFAbsoluteTimeGetCurrent() - gLastOtherProfileTs) < 0.6) return YES;
     } @catch (id e) {}
@@ -2061,7 +2141,7 @@ static id TTN_useNobility(id self, SEL _cmd, id info) {
             NSNumber *parsingUid = [ttd objectForKey:@"ttforge.parsingUid"];
             if (selfParse) isSelfInfo = YES;
             else if (parsingUid != nil) isSelfInfo = TTIsSelfUidRaw(parsingUid.unsignedIntValue);
-            else isSelfInfo = !TTIsOtherUserProfileVisible();
+            else isSelfInfo = NO;
         } else if (info && [info respondsToSelector:@selector(fLevel)]) {
             NSMutableDictionary *ttd = [[NSThread currentThread] threadDictionary];
             BOOL selfParse = [ttd objectForKey:@"ttforge.nobleOK"] != nil;
@@ -2083,7 +2163,7 @@ static id TTN_useNobility(id self, SEL _cmd, id info) {
                 objc_setAssociatedObject(info, &kTTNobleUidKey, ownerUid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 isSelfInfo = YES;
             } else {
-                isSelfInfo = !TTIsOtherUserProfileVisible();
+                isSelfInfo = NO;
             }
             static int lc = 0;
             if (isSelfInfo && TTNobleForgeOn()) {
@@ -2131,7 +2211,7 @@ static id TTN_useNobility(id self, SEL _cmd, id info) {
 static id TTN_createPriv(id self, SEL _cmd, float fLevel, id visible, id config) {
     id priv = origN_createPriv(self, _cmd, fLevel, visible, config);
     BOOL selfThread = [[[NSThread currentThread] threadDictionary] objectForKey:@"ttforge.nobleOK"] != nil;
-    if (!priv && (TTNobleForgeOn() || TTMemberForgeOn()) && (fLevel >= 0.4f || selfThread)) {
+    if (!priv && selfThread && (TTNobleForgeOn() || TTMemberForgeOn())) {
         @try {
             Class pc = NSClassFromString(@"TTNobilityPrivilege");
             float targetF = (fLevel >= 0.4f) ? fLevel : (TTNobleForgeOn() ? TTNobleBandFLevel(gNobleLevel) : 0.0f);
@@ -2139,8 +2219,8 @@ static id TTN_createPriv(id self, SEL _cmd, float fLevel, id visible, id config)
                 priv = [((id (*)(id, SEL, float, BOOL))objc_msgSend)([pc alloc], @selector(initWithFLevel:visible:), targetF, YES) autorelease];
         } @catch (id e) {}
     }
-    if (priv && selfThread) {
-        objc_setAssociatedObject(priv, &kTTSelfPrivKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (priv) {
+        objc_setAssociatedObject(priv, &kTTSelfPrivKey, @(selfThread), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return priv;
 }
@@ -2228,22 +2308,12 @@ static void TTTriggerSpecialDressDownload(id dress, id player) {
     @try {
         if (player && [dress respondsToSelector:@selector(addListener:)])
             ((void (*)(id, SEL, id))objc_msgSend)(dress, @selector(addListener:), player);
-        Class dCls = [dress class];
-        unsigned int mc = 0;
-        Method *methods = dCls ? class_copyMethodList(dCls, &mc) : NULL;
-        if (methods) {
-            for (unsigned int i = 0; i < mc; i++) {
-                SEL sel = method_getName(methods[i]);
-                const char *sn = sel ? sel_getName(sel) : NULL;
-                const char *te = method_getTypeEncoding(methods[i]);
-                if (!sn || !te) continue;
-                NSString *name = [NSString stringWithUTF8String:sn];
-                if ([name isEqualToString:@".cxx_destruct"] || [name isEqualToString:@"source"] || [name hasPrefix:@"set"]) continue;
-                if (te[0] == 'v' && [name rangeOfString:@":"].location == NSNotFound) {
-                    ((void (*)(id, SEL))objc_msgSend)(dress, sel);
-                }
+        for (NSString *dlSel in @[@"downloadSource", @"downloadSpecialDressSource", @"download", @"startDownload", @"loadSource"]) {
+            SEL s = NSSelectorFromString(dlSel);
+            if ([dress respondsToSelector:s]) {
+                ((void (*)(id, SEL))objc_msgSend)(dress, s);
+                break;
             }
-            free(methods);
         }
         id src = TTGetObj(dress, @selector(source));
         if (src) {
@@ -2256,8 +2326,6 @@ static void TTTriggerSpecialDressDownload(id dress, id player) {
             }
             if (player && [player respondsToSelector:@selector(dressSourceDidDownload:)])
                 ((void (*)(id, SEL, id))objc_msgSend)(player, @selector(dressSourceDidDownload:), dress);
-            if ([dress respondsToSelector:@selector(notifySourceDownloaded)])
-                ((void (*)(id, SEL))objc_msgSend)(dress, @selector(notifySourceDownloaded));
         }
     } @catch (id e) {}
 }
@@ -3027,20 +3095,6 @@ static NSArray *TTRealAccountVariants(NSString *seed) {
     return arr;
 }
 
-static void TTForEachAppView(void (^visitor)(UIView *v)) {
-    for (UIWindow *win in [UIApplication sharedApplication].windows) {
-        NSMutableArray *q = [NSMutableArray arrayWithObject:win];
-        while (q.count) {
-            UIView *v = q.lastObject;
-            [q removeLastObject];
-            NSString *cn = NSStringFromClass([v class]);
-            if ([cn hasPrefix:@"TTForge"] || [cn hasPrefix:@"TTNameStylePicker"] || [cn hasPrefix:@"TTLevelPicker"]) continue;
-            visitor(v);
-            if (v.subviews.count) [q addObjectsFromArray:v.subviews];
-        }
-    }
-}
-
 static void TTResizeIdPillForView(UIView *labelOrBtn) {
     if (!labelOrBtn || !labelOrBtn.superview) return;
     @try {
@@ -3195,19 +3249,11 @@ static BOOL TTRelabelViewTokens(UIView *v, NSString *fromId, NSString *toId) {
     return changed;
 }
 
-static void TTRelabelSingleToken(NSString *fromId, NSString *toId) {
-    if (!fromId.length || !toId.length || [fromId isEqualToString:toId]) return;
-    TTForEachAppView(^(UIView *v) {
-        TTRelabelViewTokens(v, fromId, toId);
-    });
-}
-
 static void TTRelabelIdSubtree(UIView *rootView, NSString *toId) {
     if (!rootView || !toId.length) return;
     @try {
         NSArray *variants = TTRealAccountVariants(nil);
         NSMutableArray *q = [NSMutableArray arrayWithObject:rootView];
-        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(?:tt|TT)?([0-9]{5,12})" options:0 error:nil];
         while (q.count) {
             UIView *v = q.lastObject;
             [q removeLastObject];
@@ -3216,32 +3262,14 @@ static void TTRelabelIdSubtree(UIView *rootView, NSString *toId) {
             if ([v isKindOfClass:[UILabel class]]) {
                 UILabel *lab = (UILabel *)v;
                 NSString *txt = lab.text ?: lab.attributedText.string;
-                if (txt.length && ![txt isEqualToString:@"复制"]) {
-                    if ([txt rangeOfString:toId].location == NSNotFound) {
-                        NSTextCheckingResult *m = [re firstMatchInString:txt options:0 range:NSMakeRange(0, txt.length)];
-                        if (m && m.range.location != NSNotFound) {
-                            NSString *matchedToken = [txt substringWithRange:m.range];
-                            TTCaptureMyRealAccount(matchedToken, TTStrictSelfUid());
-                            TTRelabelViewTokens(v, matchedToken, toId);
-                        }
-                    } else {
-                        TTResizeIdPillForView(v);
-                    }
+                if (txt.length && [txt rangeOfString:toId].location != NSNotFound) {
+                    TTResizeIdPillForView(v);
                 }
             } else if ([v isKindOfClass:[UIButton class]]) {
                 UIButton *btn = (UIButton *)v;
                 NSString *txt = [btn titleForState:UIControlStateNormal] ?: [btn attributedTitleForState:UIControlStateNormal].string;
-                if (txt.length && ![txt isEqualToString:@"复制"]) {
-                    if ([txt rangeOfString:toId].location == NSNotFound) {
-                        NSTextCheckingResult *m = [re firstMatchInString:txt options:0 range:NSMakeRange(0, txt.length)];
-                        if (m && m.range.location != NSNotFound) {
-                            NSString *matchedToken = [txt substringWithRange:m.range];
-                            TTCaptureMyRealAccount(matchedToken, TTStrictSelfUid());
-                            TTRelabelViewTokens(v, matchedToken, toId);
-                        }
-                    } else {
-                        TTResizeIdPillForView(v);
-                    }
+                if (txt.length && [txt rangeOfString:toId].location != NSNotFound) {
+                    TTResizeIdPillForView(v);
                 }
             }
             if (v.subviews.count) [q addObjectsFromArray:v.subviews];
@@ -3249,34 +3277,29 @@ static void TTRelabelIdSubtree(UIView *rootView, NSString *toId) {
     } @catch (id e) {}
 }
 
+static BOOL TTContextEffectiveIsMe(id ctx);
+
 static void TTRelabelVisibleIdLabels(NSString *fromId, NSString *toId) {
     if (!toId.length || TTIsOtherUserProfileVisible()) return;
-    for (NSString *cand in TTRealAccountVariants(fromId)) {
-        if (![cand isEqualToString:toId]) TTRelabelSingleToken(cand, toId);
-    }
-    if (gPrevCustomId.length && ![gPrevCustomId isEqualToString:toId])
-        TTRelabelSingleToken(gPrevCustomId, toId);
-    if (gLastSelfLayoutCtx) {
+    id selfCtx = TTGetLastSelfLayoutCtx();
+    if (selfCtx) {
         @try {
-            if (TTGetBool(gLastSelfLayoutCtx, @selector(isMe))) {
-                UIView *idv = TTGetObj(gLastSelfLayoutCtx, @selector(IdView));
+            if (TTContextEffectiveIsMe(selfCtx)) {
+                UIView *idv = TTGetObj(selfCtx, @selector(IdView));
                 if ([idv isKindOfClass:[UIView class]]) TTRelabelIdSubtree(idv, toId);
             }
         } @catch (id e) {}
     }
-    TTForEachAppView(^(UIView *v) {
-        NSString *cn = NSStringFromClass([v class]);
-        if ([cn rangeOfString:@"IdView" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [cn rangeOfString:@"PersonalDetailHeaderView"].location != NSNotFound) {
-            TTRelabelIdSubtree(v, toId);
-        }
-    });
 }
 
-static void TTDyeVisibleMyNicknameLabels(void) {
+static void TTDyeNicknameInSubtree(UIView *rootView) {
+    if (!rootView) return;
     NSString *myNick = TTMyNickname();
     if (!myNick.length || [myNick isEqualToString:@"我的名字"]) return;
-    TTForEachAppView(^(UIView *v) {
+    NSMutableArray *q = [NSMutableArray arrayWithObject:rootView];
+    while (q.count) {
+        UIView *v = q.lastObject;
+        [q removeLastObject];
         if ([v isKindOfClass:[UILabel class]]) {
             UILabel *lab = (UILabel *)v;
             if ([lab.text isEqualToString:myNick]) {
@@ -3285,7 +3308,20 @@ static void TTDyeVisibleMyNicknameLabels(void) {
                 lab.textColor = TTResolveNameColor(gNameStyle, gNameColorIndex, sz) ?: [UIColor labelColor];
             }
         }
-    });
+        if (v.subviews.count) [q addObjectsFromArray:v.subviews];
+    }
+}
+
+static void TTDyeVisibleMyNicknameLabels(void) {
+    id selfCtx = TTGetLastSelfLayoutCtx();
+    if (selfCtx && TTContextEffectiveIsMe(selfCtx)) {
+        UIView *idv = TTGetObj(selfCtx, @selector(IdView));
+        UIView *root = idv.superview.superview ?: idv.superview;
+        if (root) {
+            TTDyeNicknameInSubtree(root);
+            return;
+        }
+    }
 }
 
 static NSArray *TTAllResourceBundles(void) {
@@ -3354,6 +3390,10 @@ static void TTApplyBadgeImageToView(id tipView, UIImage *img) {
 
 static UIImage *TTLoadNobleBadgeImage(NSInteger nobleLv) {
     if (nobleLv <= 0) return nil;
+    static NSMutableDictionary *sNobleCache = nil;
+    if (!sNobleCache) sNobleCache = [[NSMutableDictionary alloc] init];
+    UIImage *cached = sNobleCache[@(nobleLv)];
+    if (cached) return cached;
     NSInteger idx = MAX(0, MIN(nobleLv - 1, 9));
     NSMutableArray *names = [NSMutableArray arrayWithObject:[NSString stringWithFormat:@"noble_%ld", (long)idx]];
     @try {
@@ -3366,12 +3406,18 @@ static UIImage *TTLoadNobleBadgeImage(NSInteger nobleLv) {
             }
         }
     } @catch (id e) {}
-    return TTLoadImageFromAllBundles(names);
+    UIImage *img = TTLoadImageFromAllBundles(names);
+    if (img) sNobleCache[@(nobleLv)] = img;
+    return img;
 }
 
 static UIImage *TTLoadMemberBadgeImage(NSInteger memberLv) {
     if (memberLv <= 0) return nil;
     NSInteger lv = MAX(1, MIN(memberLv, 8));
+    static NSMutableDictionary *sMemberCache = nil;
+    if (!sMemberCache) sMemberCache = [[NSMutableDictionary alloc] init];
+    UIImage *cached = sMemberCache[@(lv)];
+    if (cached) return cached;
     NSMutableArray *names = [NSMutableArray array];
     @try {
         Class pc = NSClassFromString(@"TTSuperPlayer");
@@ -3385,13 +3431,19 @@ static UIImage *TTLoadMemberBadgeImage(NSInteger memberLv) {
                 id pIcon = origC_getSuperLevelPngIcon
                     ? origC_getSuperLevelPngIcon((id)pc, @selector(getSuperLevelPngIcon:), lvlObj)
                     : ((id (*)(id, SEL, id))objc_msgSend)((id)pc, @selector(getSuperLevelPngIcon:), lvlObj);
-                if ([pIcon isKindOfClass:[UIImage class]]) return (UIImage *)pIcon;
+                if ([pIcon isKindOfClass:[UIImage class]]) {
+                    sMemberCache[@(lv)] = pIcon;
+                    return (UIImage *)pIcon;
+                }
                 if ([pIcon isKindOfClass:[NSString class]] && [(NSString *)pIcon length]) [names addObject:pIcon];
             }
         }
         if (me && origC_getLevelIcon) {
             id mIcon = origC_getLevelIcon(me, @selector(getLevelIconIsNeedNoOpen:), NO);
-            if ([mIcon isKindOfClass:[UIImage class]]) return (UIImage *)mIcon;
+            if ([mIcon isKindOfClass:[UIImage class]]) {
+                sMemberCache[@(lv)] = mIcon;
+                return (UIImage *)mIcon;
+            }
             if ([mIcon isKindOfClass:[NSString class]] && [(NSString *)mIcon length]) [names addObject:mIcon];
         }
     } @catch (id e) {}
@@ -3401,7 +3453,9 @@ static UIImage *TTLoadMemberBadgeImage(NSInteger memberLv) {
         [NSString stringWithFormat:@"sp_level_%ld", (long)lv],
         [NSString stringWithFormat:@"icon_svip_%ld", (long)lv]
     ]];
-    return TTLoadImageFromAllBundles(names);
+    UIImage *img = TTLoadImageFromAllBundles(names);
+    if (img) sMemberCache[@(lv)] = img;
+    return img;
 }
 
 static void TTApplyNobleIconToTipView(id tipView, NSInteger nobleLv) {
@@ -3431,6 +3485,7 @@ static id TTFindSuperPlayerViewInContext(id ctx) {
                 if ([inm rangeOfString:@"superPlayer" options:NSCaseInsensitiveSearch].location != NSNotFound ||
                     [inm rangeOfString:@"svip" options:NSCaseInsensitiveSearch].location != NSNotFound ||
                     [inm rangeOfString:@"vip" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    if (!TTIvarTypeMatchesAny(type, name, @[@"UIView", @"UIButton", @"UIImageView", @"superPlayer", @"svip", @"vip"])) continue;
                     id val = object_getIvar(ctx, ivars[i]);
                     if ([val isKindOfClass:[UIView class]]) {
                         free(ivars);
@@ -3495,27 +3550,26 @@ static void TTEnsureIdViewClassHooked(UIView *v, BOOL isMe) {
 }
 
 static BOOL TTContextEffectiveIsMe(id ctx) {
-    if (!ctx) return !TTIsOtherUserProfileVisible();
+    if (!ctx) return NO;
     BOOL raw = origH_isMe ? origH_isMe(ctx, @selector(isMe)) : TTGetBool(ctx, @selector(isMe));
     if (raw) return YES;
     NSNumber *exp = objc_getAssociatedObject(ctx, &kTTCtxExplicitIsMeKey);
     if (exp != nil) return exp.boolValue;
-    return !TTIsOtherUserProfileVisible();
+    return NO;
 }
 
 static void TTSyncProfileContextOwnership(id ctx, BOOL isMe) {
     if (!ctx) return;
-    gLatestLayoutCtx = ctx;
-    NSNumber *exp = objc_getAssociatedObject(ctx, &kTTCtxExplicitIsMeKey);
-    if (!isMe && exp != nil && !exp.boolValue) {
+    TTSetLatestLayoutCtx(ctx);
+    if (!isMe) {
         gActiveProfileIsOther = YES;
         gLastOtherProfileTs = CFAbsoluteTimeGetCurrent();
-        gLastOtherLayoutCtx = ctx;
-    } else if (isMe) {
+        TTSetLastOtherLayoutCtx(ctx);
+    } else {
         gActiveProfileIsOther = NO;
         gLastOtherProfileTs = 0;
-        gLastSelfLayoutCtx = ctx;
-        if (gLastOtherLayoutCtx == ctx) gLastOtherLayoutCtx = nil;
+        TTSetLastSelfLayoutCtx(ctx);
+        if (TTGetLastOtherLayoutCtx() == ctx) TTSetLastOtherLayoutCtx(nil);
     }
     @try {
         UIView *idv = TTGetObj(ctx, @selector(IdView));
@@ -3527,7 +3581,8 @@ static void TTSyncProfileContextOwnership(id ctx, BOOL isMe) {
             if (!ivars) continue;
             for (unsigned int i = 0; i < count; i++) {
                 const char *type = ivar_getTypeEncoding(ivars[i]);
-                if (!type || type[0] != '@') continue;
+                const char *name = ivar_getName(ivars[i]);
+                if (!TTIvarTypeMatchesAny(type, name, @[@"UGCUserInfo", @"SuperPlayer", @"NobilityPrivilege"])) continue;
                 id val = object_getIvar(ctx, ivars[i]);
                 if (!val) continue;
                 NSString *vcn = NSStringFromClass([val class]);
@@ -3539,10 +3594,6 @@ static void TTSyncProfileContextOwnership(id ctx, BOOL isMe) {
                         [[NSUserDefaults standardUserDefaults] setObject:@(u) forKey:@"ttforge.selfUid"];
                     }
                     if (u > 0) TTTagNobilityInfoOnObject(val, u);
-                    if (isMe && gCustomId.length && [val respondsToSelector:@selector(setAccount:)]) {
-                        TTSnapObj(val, @"account", @selector(account));
-                        TTSetObj(val, @selector(setAccount:), gCustomId);
-                    }
                 } else if ([vcn rangeOfString:@"NobilityPrivilege"].location != NSNotFound) {
                     objc_setAssociatedObject(val, &kTTSelfPrivKey, @(isMe), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 }
@@ -3575,6 +3626,13 @@ static void TTApplySelfBadgesToContext(id ctx) {
             if (origH_appear) origH_appear(ctx, @selector(handlerSuperPlayerViewAppear:), YES);
             TTApplyMemberIconToContext(ctx, gMemberLevel);
         }
+        if (gCustomId.length) {
+            UIView *idv = TTGetObj(ctx, @selector(IdView));
+            if ([idv isKindOfClass:[UIView class]]) {
+                TTEnsureIdViewClassHooked((UIView *)idv, YES);
+                TTRelabelIdSubtree((UIView *)idv, gCustomId);
+            }
+        }
         if (origH_updateNickLayout) origH_updateNickLayout(ctx, @selector(handlerUpdateNickNameViewLayout));
         gInApplySelfBadges = NO;
     } @catch (id e) {
@@ -3585,7 +3643,7 @@ static void TTApplySelfBadgesToContext(id ctx) {
 static id (*origH_init)(id, SEL);
 static id TTH_init(id self, SEL _cmd) {
     id r = origH_init ? origH_init(self, _cmd) : nil;
-    if (r) gLatestLayoutCtx = r;
+    if (r) TTSetLatestLayoutCtx(r);
     return r;
 }
 
@@ -3615,7 +3673,9 @@ static void TTH_updateNickLayout(id self, SEL _cmd) {
         }
     } @catch (id e) {}
     if (origH_updateNickLayout) origH_updateNickLayout(self, _cmd);
-    if (isMe && !gInApplySelfBadges) TTApplySelfBadgesToContext(self);
+    if (isMe && TTMemberForgeOn()) {
+        TTApplyMemberIconToContext(self, gMemberLevel);
+    }
 }
 
 static void (*origH_setIsMe)(id, SEL, BOOL);
@@ -3625,25 +3685,21 @@ static void TTH_setIsMe(id self, SEL _cmd, BOOL isMe) {
     TTSyncProfileContextOwnership(self, isMe);
     if (isMe) {
         TTApplySelfBadgesToContext(self);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            TTApplySelfBadgesToContext(self);
-        });
     }
 }
 
 static BOOL TTH_isMe(id self, SEL _cmd) {
     BOOL isMe = origH_isMe ? origH_isMe(self, _cmd) : NO;
-    gLatestLayoutCtx = self;
-    NSNumber *exp = objc_getAssociatedObject(self, &kTTCtxExplicitIsMeKey);
+    TTSetLatestLayoutCtx(self);
     if (isMe) {
         gActiveProfileIsOther = NO;
         gLastOtherProfileTs = 0;
-        gLastSelfLayoutCtx = self;
-        if (gLastOtherLayoutCtx == self) gLastOtherLayoutCtx = nil;
-    } else if (exp != nil && !exp.boolValue) {
+        TTSetLastSelfLayoutCtx(self);
+        if (TTGetLastOtherLayoutCtx() == self) TTSetLastOtherLayoutCtx(nil);
+    } else {
         gActiveProfileIsOther = YES;
         gLastOtherProfileTs = CFAbsoluteTimeGetCurrent();
-        gLastOtherLayoutCtx = self;
+        TTSetLastOtherLayoutCtx(self);
     }
     return isMe;
 }
@@ -3670,9 +3726,6 @@ static void TTH_setIdView(id self, SEL _cmd, id v) {
             TTEnsureIdViewClassHooked((UIView *)v, isMe);
             if (isMe && gCustomId.length) {
                 TTRelabelIdSubtree((UIView *)v, gCustomId);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (gCustomId.length) TTRelabelIdSubtree((UIView *)v, gCustomId);
-                });
             }
         }
     } @catch (id e) {}
@@ -3684,17 +3737,7 @@ static void TTH_appear(id self, SEL _cmd, BOOL appear) {
         isMe = TTContextEffectiveIsMe(self);
         gLastPrivWasSelf = isMe;
         TTSyncProfileContextOwnership(self, isMe);
-        if (isMe) {
-            if (TTMemberForgeOn()) appear = YES;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                TTDyeVisibleMyNicknameLabels();
-                if (gCustomId.length) TTRelabelVisibleIdLabels(TTMyRealAccount(), gCustomId);
-            });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                TTDyeVisibleMyNicknameLabels();
-                if (gCustomId.length) TTRelabelVisibleIdLabels(TTMyRealAccount(), gCustomId);
-            });
-        }
+        if (isMe && TTMemberForgeOn()) appear = YES;
     } @catch (id e) {}
     NSMutableDictionary *ttd = [[NSThread currentThread] threadDictionary];
     if (isMe) [ttd setObject:@YES forKey:@"ttforge.nobleOK"];
@@ -3730,24 +3773,17 @@ static void TTH_nobleAppear(id self, SEL _cmd, BOOL appear) {
         if (btn) {
             if ([btn isKindOfClass:[UIView class]]) ((UIView *)btn).hidden = NO;
             TTApplyNobleIconToTipView(btn, gNobleLevel);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (TTNobleForgeOn() && [btn isKindOfClass:[UIView class]]) {
-                    ((UIView *)btn).hidden = NO;
-                    TTApplyNobleIconToTipView(btn, gNobleLevel);
-                }
-            });
         }
     } @catch (id e) {}
 }
 
 static void (*origH_didReloadData)(id, SEL, BOOL, id, id, id, id);
 static void TTH_didReloadData(id self, SEL _cmd, BOOL isShow, id scanerViews, id photoDetailView, id pageBgView, id homeBgV) {
-    BOOL isMe = YES;
+    BOOL isMe = NO;
     @try {
-        if (gLatestLayoutCtx) {
-            isMe = origH_isMe ? origH_isMe(gLatestLayoutCtx, @selector(isMe)) : TTGetBool(gLatestLayoutCtx, @selector(isMe));
-        } else {
-            isMe = !TTIsOtherUserProfileVisible();
+        id latestCtx = TTGetLatestLayoutCtx();
+        if (latestCtx) {
+            isMe = TTContextEffectiveIsMe(latestCtx);
         }
     } @catch (id e) {}
     NSMutableDictionary *ttd = [[NSThread currentThread] threadDictionary];
@@ -3755,35 +3791,30 @@ static void TTH_didReloadData(id self, SEL _cmd, BOOL isShow, id scanerViews, id
     if (origH_didReloadData) origH_didReloadData(self, _cmd, isShow, scanerViews, photoDetailView, pageBgView, homeBgV);
     if (isMe) [ttd removeObjectForKey:@"ttforge.nobleOK"];
     @try {
-        if (gLatestLayoutCtx) {
-            isMe = origH_isMe ? origH_isMe(gLatestLayoutCtx, @selector(isMe)) : TTGetBool(gLatestLayoutCtx, @selector(isMe));
+        id latestCtx = TTGetLatestLayoutCtx();
+        if (latestCtx) {
+            isMe = TTContextEffectiveIsMe(latestCtx);
         }
         if (isMe) {
-            if (gCustomId.length && [self isKindOfClass:[UIViewController class]]) {
-                UIView *v = ((UIViewController *)self).viewIfLoaded;
-                if (v) TTRelabelIdSubtree(v, gCustomId);
-            }
-            if (gLastSelfLayoutCtx && (origH_isMe ? origH_isMe(gLastSelfLayoutCtx, @selector(isMe)) : TTGetBool(gLastSelfLayoutCtx, @selector(isMe)))) {
+            id selfCtx = TTGetLastSelfLayoutCtx() ?: latestCtx;
+            if (selfCtx && TTContextEffectiveIsMe(selfCtx)) {
                 if (TTNobleForgeOn()) {
-                    if (origH_nobleAppear) origH_nobleAppear(gLastSelfLayoutCtx, @selector(handlerNobilityTipViewAppear:), YES);
-                    id btn = TTGetObj(gLastSelfLayoutCtx, @selector(nobilityTipView));
+                    if (origH_nobleAppear) origH_nobleAppear(selfCtx, @selector(handlerNobilityTipViewAppear:), YES);
+                    id btn = TTGetObj(selfCtx, @selector(nobilityTipView));
                     if (btn) TTApplyNobleIconToTipView(btn, gNobleLevel);
                 }
                 if (TTMemberForgeOn()) {
-                    if (origH_appear) origH_appear(gLastSelfLayoutCtx, @selector(handlerSuperPlayerViewAppear:), YES);
-                    TTApplyMemberIconToContext(gLastSelfLayoutCtx, gMemberLevel);
+                    if (origH_appear) origH_appear(selfCtx, @selector(handlerSuperPlayerViewAppear:), YES);
+                    TTApplyMemberIconToContext(selfCtx, gMemberLevel);
                 }
                 if (gCustomId.length) {
-                    UIView *idv = TTGetObj(gLastSelfLayoutCtx, @selector(IdView));
+                    UIView *idv = TTGetObj(selfCtx, @selector(IdView));
                     if ([idv isKindOfClass:[UIView class]]) TTRelabelIdSubtree(idv, gCustomId);
                 }
             }
-            for (NSNumber *delay in @[@0.0, @0.1, @0.3]) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    if (TTIsOtherUserProfileVisible()) return;
-                    TTDyeVisibleMyNicknameLabels();
-                    if (gCustomId.length) TTRelabelVisibleIdLabels(TTMyRealAccount(), gCustomId);
-                });
+            if ([self isKindOfClass:[UIViewController class]]) {
+                UIView *v = ((UIViewController *)self).viewIfLoaded;
+                if (v) TTDyeNicknameInSubtree(v);
             }
         }
     } @catch (id e) {}
@@ -4482,7 +4513,10 @@ static void TTTriggerLocalMagicEcho(uint32_t tabId, uint32_t magicId) {
                         }
                     }
                 }
+                #pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
                 UIWindow *win = [UIApplication sharedApplication].keyWindow;
+#pragma clang diagnostic pop
                 if (win) {
                     NSMutableArray *q = [NSMutableArray arrayWithObject:win];
                     while (q.count > 0) {
@@ -4526,8 +4560,6 @@ static void TTReforgeGPBObject(id obj) {
     @try {
         if ([cn isEqualToString:@"UserUGCInfo"]) { TTForgeUGC(obj); return; }
         if ([cn isEqualToString:@"TTUGCUserInfo"] || [cn isEqualToString:@"TTSuperPlayer"]) {
-            TTSnapObj(obj, @"account", @selector(account));
-            if (gCustomId.length) TTSetObj(obj, @selector(setAccount:), gCustomId);
             uint32_t u = TTPlayerUidOf(obj) ?: TTStrictSelfUid();
             if (u > 0) TTTagNobilityInfoOnObject(obj, u);
             return;
@@ -4561,14 +4593,15 @@ static void TTRestoreAndReforgeGPB(void) {
 static void TTApplyForgeStateNow(NSString *what) {
     @try {
         [[NSNotificationCenter defaultCenter] postNotificationName:@"ttc://superPlayer/superPlayerStatusChanged" object:TTCMePlayer()];
-        if (gLastSelfLayoutCtx && (origH_isMe ? origH_isMe(gLastSelfLayoutCtx, @selector(isMe)) : TTGetBool(gLastSelfLayoutCtx, @selector(isMe)))) {
-            if (origH_nobleAppear) origH_nobleAppear(gLastSelfLayoutCtx, @selector(handlerNobilityTipViewAppear:), TTNobleForgeOn());
+        id selfCtx = TTGetLastSelfLayoutCtx();
+        if (selfCtx && TTContextEffectiveIsMe(selfCtx)) {
+            if (origH_nobleAppear) origH_nobleAppear(selfCtx, @selector(handlerNobilityTipViewAppear:), TTNobleForgeOn());
             if (TTNobleForgeOn()) {
-                id btn = TTGetObj(gLastSelfLayoutCtx, @selector(nobilityTipView));
+                id btn = TTGetObj(selfCtx, @selector(nobilityTipView));
                 if (btn) TTApplyNobleIconToTipView(btn, gNobleLevel);
             }
-            if (origH_appear) origH_appear(gLastSelfLayoutCtx, @selector(handlerSuperPlayerViewAppear:), TTMemberForgeOn());
-            TTApplyMemberIconToContext(gLastSelfLayoutCtx, gMemberLevel);
+            if (origH_appear) origH_appear(selfCtx, @selector(handlerSuperPlayerViewAppear:), TTMemberForgeOn());
+            TTApplyMemberIconToContext(selfCtx, gMemberLevel);
         }
     } @catch (id e) {}
     TTDyeVisibleMyNicknameLabels();
@@ -4577,6 +4610,8 @@ static void TTApplyForgeStateNow(NSString *what) {
 }
 
 static UIWindow *TTKeyWindow(void) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     NSArray *wins = [UIApplication sharedApplication].windows;
     UIWindow *best = nil; CGFloat bestArea = -1;
     for (UIWindow *w in wins) {
@@ -4590,67 +4625,7 @@ static UIWindow *TTKeyWindow(void) {
     }
     UIWindow *kw = [UIApplication sharedApplication].keyWindow;
     return (kw && kw.rootViewController) ? kw : nil;
-}
-
-static void TTConfigureSheetModal(UIViewController *vc) {
-    vc.modalPresentationStyle = UIModalPresentationPageSheet;
-    if (@available(iOS 15.0, *)) {
-        UISheetPresentationController *sheet = vc.sheetPresentationController;
-        sheet.detents = @[[UISheetPresentationControllerDetent mediumDetent], [UISheetPresentationControllerDetent largeDetent]];
-        sheet.prefersGrabberVisible = YES;
-    }
-}
-
-static CGFloat TTSetupModalHeader(UIView *view, NSString *titleText, NSString *btnTitle, id target, SEL action) {
-    view.backgroundColor = [UIColor systemBackgroundColor];
-    CGFloat W = view.bounds.size.width;
-    if (W < 50) W = [UIScreen mainScreen].bounds.size.width;
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 16, 240, 28)];
-    title.text = titleText;
-    title.font = [UIFont boldSystemFontOfSize:19];
-    [view addSubview:title];
-    [title release];
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(W - 76, 14, 60, 32);
-    btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [btn setTitle:btnTitle forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont systemFontOfSize:16];
-    [btn addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
-    [view addSubview:btn];
-    return W;
-}
-
-static UILabel *TTAddPickerRow(UIScrollView *sv, CGFloat y, CGFloat W, CGFloat H, NSInteger tag, id target, SEL action, BOOL checked) {
-    UIButton *row = [UIButton buttonWithType:UIButtonTypeCustom];
-    row.frame = CGRectMake(0, y, W, H);
-    row.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    row.tag = tag;
-    [row addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
-    UILabel *lab = [[[UILabel alloc] initWithFrame:CGRectMake(20, 0, W - 70, H)] autorelease];
-    lab.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [row addSubview:lab];
-    if (checked) {
-        UILabel *ck = [[UILabel alloc] initWithFrame:CGRectMake(W - 46, 0, 30, H)];
-        ck.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-        ck.text = @"✓";
-        ck.textColor = [UIColor systemBlueColor];
-        ck.font = [UIFont boldSystemFontOfSize:18];
-        [row addSubview:ck];
-        [ck release];
-    }
-    [sv addSubview:row];
-    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(20, y + H - 0.5, W - 20, 0.5)];
-    sep.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    sep.backgroundColor = [UIColor colorWithWhite:0.85 alpha:1.0];
-    [sv addSubview:sep];
-    [sep release];
-    return lab;
-}
-
-static void TTDismissAndRefreshPanel(UIViewController *vc, id panel) {
-    [vc dismissViewControllerAnimated:YES completion:nil];
-    if (panel && [panel respondsToSelector:@selector(rebuildRows)])
-        [panel performSelector:@selector(rebuildRows)];
+#pragma clang diagnostic pop
 }
 
 static NSArray *TTNamePresetList(void) {
@@ -4685,331 +4660,38 @@ static NSAttributedString *TTNamePreviewAttr(NSString *nick, NSInteger ps, NSInt
     else suffix = @" · SVIP图案 原生";
     NSMutableAttributedString *mas = [[[NSMutableAttributedString alloc] init] autorelease];
     [mas appendAttributedString:[[[NSAttributedString alloc] initWithString:nick attributes:@{
-        NSFontAttributeName: [UIFont boldSystemFontOfSize:17],
-        NSForegroundColorAttributeName: col ?: [UIColor labelColor] }] autorelease]];
+        NSFontAttributeName: [UIFont boldSystemFontOfSize:15],
+        NSForegroundColorAttributeName: col ?: [UIColor colorWithRed:0.95 green:0.22 blue:0.68 alpha:1] }] autorelease]];
     [mas appendAttributedString:[[[NSAttributedString alloc] initWithString:suffix attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:14],
-        NSForegroundColorAttributeName: [UIColor grayColor] }] autorelease]];
+        NSFontAttributeName: [UIFont systemFontOfSize:12],
+        NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }] autorelease]];
     return mas;
 }
 
-@interface TTForgePanel : UIViewController {
-    UIScrollView *_box;
-}
-+ (void)showPanel;
-- (void)rebuildRows;
-@end
-
-@interface TTNameStylePicker : UIViewController
-@property (nonatomic, assign) id panel;
-@end
-
-@implementation TTNameStylePicker
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    CGFloat W = TTSetupModalHeader(self.view, @"名字样式", @"关闭", self, @selector(closeTapped));
-    UILabel *cur = [[UILabel alloc] initWithFrame:CGRectMake(20, 46, W - 40, 20)];
-    cur.text = [NSString stringWithFormat:@"当前：%@", TTNamePresetName()];
-    cur.font = [UIFont systemFontOfSize:13];
-    cur.textColor = [UIColor grayColor];
-    [self.view addSubview:cur];
-    [cur release];
-
-    UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 74, W, self.view.bounds.size.height - 74)];
-    sv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    NSString *nick = TTMyNickname();
-    NSArray *presets = TTNamePresetList();
-    CGFloat y = 0;
-    for (NSUInteger i = 0; i < presets.count; i++) {
-        NSDictionary *pr = presets[i];
-        NSInteger ps = [pr[@"s"] integerValue], pcIdx = [pr[@"c"] integerValue];
-        UILabel *lab = TTAddPickerRow(sv, y, W, 54, (NSInteger)i, self, @selector(rowTapped:), (ps == gNameStyle && pcIdx == gNameColorIndex));
-        lab.attributedText = TTNamePreviewAttr(nick, ps, pcIdx);
-        y += 54;
-    }
-    sv.contentSize = CGSizeMake(W, y + 16);
-    [self.view addSubview:sv];
-    [sv release];
+static NSString *TTLogFileSizeText(void) {
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:TTLogPath() error:nil];
+    unsigned long long bytes = [attrs[NSFileSize] unsignedLongLongValue];
+    if (bytes == 0) return @"0 KB";
+    if (bytes < 1024) return [NSString stringWithFormat:@"%llu B", bytes];
+    if (bytes < 1024 * 1024) return [NSString stringWithFormat:@"%.1f KB", (double)bytes / 1024.0];
+    return [NSString stringWithFormat:@"%.2f MB", (double)bytes / (1024.0 * 1024.0)];
 }
 
-- (void)rowTapped:(UIButton *)b {
-    NSArray *presets = TTNamePresetList();
-    if (b.tag < 0 || (NSUInteger)b.tag >= presets.count) return;
-    NSDictionary *pr = presets[(NSUInteger)b.tag];
-    NSInteger ps = [pr[@"s"] integerValue], pcIdx = [pr[@"c"] integerValue];
-    gNameStyle = ps;
-    gNameColorIndex = pcIdx;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setInteger:ps forKey:@"ttforge.nameStyle"];
-    [ud setBool:(ps != 0) forKey:@"ttforge.nameColor"];
-    [ud setInteger:pcIdx forKey:@"ttforge.nameColorIndex"];
-    TTLog(@"面板 名字样式 → %@", TTNamePresetName());
-    TTApplyForgeStateNow(@"名字样式");
-    TTDismissAndRefreshPanel(self, self.panel);
-}
-
-- (void)closeTapped {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-@end
-
-typedef NS_ENUM(NSInteger, TTLevelPickerType) {
-    TTLevelPickerMember = 1,
-    TTLevelPickerNoble  = 2,
-    TTLevelPickerRich   = 3,
-    TTLevelPickerCharm  = 4,
-};
-
-@interface TTLevelPicker : UIViewController
-@property (nonatomic, assign) TTLevelPickerType pickerType;
-@property (nonatomic, assign) id panel;
-@end
-
-@implementation TTLevelPicker
-- (NSArray *)optionsList {
-    switch (self.pickerType) {
-        case TTLevelPickerMember:
-            return @[
-                @{@"t": @"原样（真实数据）", @"v": @0},
-                @{@"t": @"SVIP 1", @"v": @1}, @{@"t": @"SVIP 2", @"v": @2},
-                @{@"t": @"SVIP 3", @"v": @3}, @{@"t": @"SVIP 4", @"v": @4},
-                @{@"t": @"SVIP 5", @"v": @5}, @{@"t": @"SVIP 6", @"v": @6},
-                @{@"t": @"SVIP 7", @"v": @7}, @{@"t": @"SVIP 8（满级）", @"v": @8},
-            ];
-        case TTLevelPickerNoble:
-            return @[
-                @{@"t": @"原样（真实数据）", @"v": @0},
-                @{@"t": @"1级 · 少爵", @"v": @1}, @{@"t": @"2级 · 男爵", @"v": @2},
-                @{@"t": @"3级 · 子爵", @"v": @3}, @{@"t": @"4级 · 伯爵", @"v": @4},
-                @{@"t": @"5级 · 侯爵", @"v": @5}, @{@"t": @"6级 · 公爵", @"v": @6},
-                @{@"t": @"7级 · 郡王", @"v": @7}, @{@"t": @"8级 · 亲王", @"v": @8},
-                @{@"t": @"9级 · 国王", @"v": @9}, @{@"t": @"10级 · 神王（满级）", @"v": @10},
-            ];
-        case TTLevelPickerRich:
-            return @[
-                @{@"t": @"原样（真实数据）", @"v": @0},
-                @{@"t": @"优雅才子", @"v": @10}, @{@"t": @"圣殿绅士", @"v": @11},
-                @{@"t": @"荣耀城主", @"v": @101}, @{@"t": @"尊贵诸侯", @"v": @1001},
-                @{@"t": @"枭雄霸王", @"v": @10001}, @{@"t": @"至尊帝皇", @"v": @100001},
-                @{@"t": @"永恒帝尊", @"v": @1000001},
-            ];
-        case TTLevelPickerCharm:
-            return @[
-                @{@"t": @"原样（真实数据）", @"v": @0},
-                @{@"t": @"初见锋芒", @"v": @10}, @{@"t": @"见习偶像", @"v": @11},
-                @{@"t": @"名声大振", @"v": @101}, @{@"t": @"人气之星", @"v": @1001},
-                @{@"t": @"光辉夺目", @"v": @10001}, @{@"t": @"风华绝代", @"v": @100001},
-                @{@"t": @"永恒璀璨", @"v": @1000001},
-            ];
-    }
-    return @[];
-}
-
-- (NSInteger)currentValue {
-    switch (self.pickerType) {
-        case TTLevelPickerMember: return gMemberLevel;
-        case TTLevelPickerNoble:  return gNobleLevel;
-        case TTLevelPickerRich:   return gRichLevelVal;
-        case TTLevelPickerCharm:  return gCharmLevelVal;
-    }
-    return 0;
-}
-
-- (NSString *)pickerTitle {
-    switch (self.pickerType) {
-        case TTLevelPickerMember: return @"会员等级";
-        case TTLevelPickerNoble:  return @"贵族等级";
-        case TTLevelPickerRich:   return @"财富等级";
-        case TTLevelPickerCharm:  return @"魅力等级";
-    }
-    return @"选择等级";
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    CGFloat W = TTSetupModalHeader(self.view, [self pickerTitle], @"关闭", self, @selector(closeTapped));
-    UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 56, W, self.view.bounds.size.height - 56)];
-    sv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    NSArray *opts = [self optionsList];
-    NSInteger curVal = [self currentValue];
-    CGFloat y = 0;
-    for (NSUInteger i = 0; i < opts.count; i++) {
-        NSDictionary *item = opts[i];
-        NSInteger val = [item[@"v"] integerValue];
-        BOOL isCur = (val == curVal) ||
-            ((self.pickerType == TTLevelPickerRich || self.pickerType == TTLevelPickerCharm) &&
-             val > 0 && curVal > 0 && TTTitleBandForValue(val) == TTTitleBandForValue(curVal));
-        UILabel *lab = TTAddPickerRow(sv, y, W, 52, (NSInteger)i, self, @selector(rowTapped:), isCur);
-        lab.text = item[@"t"];
-        lab.font = isCur ? [UIFont boldSystemFontOfSize:16] : [UIFont systemFontOfSize:16];
-        lab.textColor = [UIColor labelColor];
-        y += 52;
-    }
-    sv.contentSize = CGSizeMake(W, y + 16);
-    [self.view addSubview:sv];
-    [sv release];
-}
-
-- (void)rowTapped:(UIButton *)b {
-    NSArray *opts = [self optionsList];
-    if (b.tag < 0 || (NSUInteger)b.tag >= opts.count) return;
-    NSInteger val = [opts[(NSUInteger)b.tag][@"v"] integerValue];
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    switch (self.pickerType) {
-        case TTLevelPickerMember: gMemberLevel   = val; [d setInteger:val forKey:@"ttforge.memberLevel"];   break;
-        case TTLevelPickerNoble:  gNobleLevel    = val; [d setInteger:val forKey:@"ttforge.nobleLevel"];    break;
-        case TTLevelPickerRich:   gRichLevelVal  = val; [d setInteger:val forKey:@"ttforge.richLevelVal"];  break;
-        case TTLevelPickerCharm:  gCharmLevelVal = val; [d setInteger:val forKey:@"ttforge.charmLevelVal"]; break;
-    }
-    TTRestoreAndReforgeGPB();
-    TTLog(@"面板 %@ → %ld", [self pickerTitle], (long)val);
-    TTApplyForgeStateNow([self pickerTitle]);
-    TTDismissAndRefreshPanel(self, self.panel);
-}
-
-- (void)closeTapped {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-@end
-
-static TTForgePanel *gTTPanel = nil;
-
-@implementation TTForgePanel
-+ (void)showPanel {
-    if (gTTPanel && gTTPanel.presentingViewController) {
-        TTLog(@"面板 已关闭（再次点击悬浮球）");
-        [gTTPanel dismissViewControllerAnimated:YES completion:nil];
-        gTTPanel = nil;
-        return;
-    }
-    TTForgePanel *vc = [[[TTForgePanel alloc] init] autorelease];
-    gTTPanel = vc;
-    TTConfigureSheetModal(vc);
-    UIWindow *mw = TTKeyWindow();
-    UIViewController *root = mw.rootViewController;
-    TTLog(@"面板 打开尝试 window=%@ root=%@", mw ? NSStringFromClass([mw class]) : @"nil", root ? NSStringFromClass([root class]) : @"nil");
-    if (!root) { TTLog(@"面板 打开失败：无根控制器"); return; }
-    while (root.presentedViewController) root = root.presentedViewController;
-    [root presentViewController:vc animated:YES completion:nil];
-    TTLog(@"面板 已打开（独立面板）");
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    TTSetupModalHeader(self.view, @"TTForge 设置", @"完成", self, @selector(closeTapped));
-    _box = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 54, self.view.bounds.size.width, self.view.bounds.size.height - 54)];
-    _box.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _box.alwaysBounceVertical = YES;
-    [self.view addSubview:_box];
-    [_box release];
-    [self rebuildRows];
-}
-
-- (void)closeTapped {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-
-- (void)viewDidDisappear:(BOOL)animated {
-    [super viewDidDisappear:animated];
-    if (self == gTTPanel && [self isBeingDismissed]) gTTPanel = nil;
-}
-
-- (void)blockSwitchChanged:(UISwitch *)sender {
-    gBlockReport = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gBlockReport;
-    [[NSUserDefaults standardUserDefaults] setBool:gBlockReport forKey:@"ttforge.blockReport"];
-    TTLog(@"状态设置 访问隐身 → %@", gBlockReport ? @"开" : @"关");
-}
-
-- (void)sneakSwitchChanged:(UISwitch *)sender {
-    gSneakAll = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gSneakAll;
-    [[NSUserDefaults standardUserDefaults] setBool:gSneakAll forKey:@"ttforge.sneakAll"];
-    TTLog(@"状态设置 悄悄看所有人 → %@", gSneakAll ? @"开" : @"关");
-}
-
-- (void)h5SwitchChanged:(UISwitch *)sender {
-    gH5Capture = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gH5Capture;
-    [[NSUserDefaults standardUserDefaults] setBool:gH5Capture forKey:@"ttforge.h5capture"];
-    TTLog(@"状态设置 H5抓取 → %@（K 层门控实时读取，即时生效）", gH5Capture ? @"开" : @"关");
-}
-
-- (void)rtAntiMuteChanged:(UISwitch *)sender {
-    gRTAntiMute = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gRTAntiMute;
-    [[NSUserDefaults standardUserDefaults] setBool:gRTAntiMute forKey:@"ttforge.rtAntiMute"];
-    TTLog(@"状态设置 防闭麦 → %@", gRTAntiMute ? @"开" : @"关");
-}
-
-- (void)rtAntiClearChanged:(UISwitch *)sender {
-    gRTAntiClear = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gRTAntiClear;
-    [[NSUserDefaults standardUserDefaults] setBool:gRTAntiClear forKey:@"ttforge.rtAntiClear"];
-    TTLog(@"状态设置 防清屏 → %@", gRTAntiClear ? @"开" : @"关");
-}
-
-- (void)rtAudio192Changed:(UISwitch *)sender {
-    gRTAudio192 = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gRTAudio192;
-    [[NSUserDefaults standardUserDefaults] setBool:gRTAudio192 forKey:@"ttforge.rtAudio192"];
-    TTLog(@"状态设置 192k音质 → %@", gRTAudio192 ? @"开" : @"关");
-}
-
-- (void)rtSkinChanged:(UISwitch *)sender {
-    gRTSkin = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gRTSkin;
-    [[NSUserDefaults standardUserDefaults] setBool:gRTSkin forKey:@"ttforge.rtSkin"];
-    TTLog(@"状态设置 皮肤DressId → %@", gRTSkin ? @"开" : @"关");
-}
-
-- (void)rtAntiKickChanged:(UISwitch *)sender {
-    gRTAntiKick = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gRTAntiKick;
-    [[NSUserDefaults standardUserDefaults] setBool:gRTAntiKick forKey:@"ttforge.rtAntiKick"];
-    TTLog(@"状态设置 防踢 → %@", gRTAntiKick ? @"开" : @"关");
-}
-
-- (void)rtUpMicChanged:(UISwitch *)sender {
-    gRTUpMic = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gRTUpMic;
-    [[NSUserDefaults standardUserDefaults] setBool:gRTUpMic forKey:@"ttforge.rtUpMic"];
-    TTLog(@"状态设置 万能上麦 → %@", gRTUpMic ? @"开" : @"关");
-}
-
-- (void)rtIslandChanged:(UISwitch *)sender {
-    gRTIsland = [sender isKindOfClass:[UISwitch class]] ? sender.isOn : !gRTIsland;
-    [[NSUserDefaults standardUserDefaults] setBool:gRTIsland forKey:@"ttforge.rtIsland"];
-    TTLog(@"状态设置 灵动岛记录 → %@", gRTIsland ? @"开" : @"关");
-}
-
-- (void)panelRTDressId {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"皮肤DressId"
-        message:@"填房间套装 DressId，0 表示只记录不替换"
-        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = gRTDressId ? [NSString stringWithFormat:@"%u", gRTDressId] : @"";
-        tf.placeholder = @"DressId";
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    __block TTForgePanel *bs = self;
-    [ac addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSString *t = ac.textFields.firstObject.text ?: @"";
-        gRTDressId = (uint32_t)[t intValue];
-        [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)gRTDressId forKey:@"ttforge.rtDressId"];
-        TTLog(@"状态设置 皮肤DressId → %u", gRTDressId);
-        [bs rebuildRows];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)panelExport {
+static void TTExportLogFile(void) {
     @try {
         NSString *path = TTLogPath();
-        UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
+        UIWindow *mw = TTKeyWindow();
+        UIViewController *root = mw ? mw.rootViewController : nil;
         while (root.presentedViewController) root = root.presentedViewController;
         if (!root) return;
         UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
         [root presentViewController:av animated:YES completion:nil];
         [av release];
-        TTLog(@"状态设置 导出日志");
+        TTLog(@"日志菜单 导出日志");
     } @catch (id e) { TTLog(@"导出日志异常 %@", e); }
 }
 
-- (void)panelClear {
+static void TTClearLogFile(void) {
     @try {
         if (gLogQueue) {
             dispatch_sync(gLogQueue, ^{
@@ -5021,47 +4703,15 @@ static TTForgePanel *gTTPanel = nil;
         } else {
             [[NSFileManager defaultManager] removeItemAtPath:TTLogPath() error:nil];
         }
-        TTLog(@"日志已清空（状态设置）");
+        TTLog(@"日志已清空（日志菜单）");
     } @catch (id e) {}
 }
 
-- (void)panelUidLock {
-    @try {
-        NSArray *keys = nil;
-        @synchronized (gHits) {
-            keys = [[gHits keysSortedByValueUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-                return [b[@"count"] compare:a[@"count"]];
-            }] retain];
-        }
-        if (keys.count) {
-            NSUInteger idx = 0;
-            for (NSUInteger i = 0; i < keys.count; i++) {
-                if ([keys[i] unsignedIntValue] == gSelfUid) { idx = (i + 1) % keys.count; break; }
-            }
-            gSelfUid = [keys[idx] unsignedIntValue];
-            [[NSUserDefaults standardUserDefaults] setObject:@(gSelfUid) forKey:@"ttforge.selfUid"];
-            TTLog(@"状态设置 账号锁定 → uid=%u %@（候选 %lu 个，点按轮换）", gSelfUid,
-                  gHits[@(gSelfUid)][@"nickname"] ?: @"", (unsigned long)keys.count);
-        } else {
-            TTLog(@"状态设置 账号锁定：暂无候选（先浏览任意主页/资料页产生命中）");
-        }
-        [keys release];
-    } @catch (id e) { TTLog(@"账号锁定异常 %@", e); }
-    TTApplyForgeStateNow(@"账号锁定");
-    [self rebuildRows];
-}
-
-- (void)panelResetLock {
-    gSelfUid = 0;
-    @synchronized (gHits) { [gHits removeAllObjects]; }
-    @synchronized (gForgedPlayers) { [gForgedPlayers removeAllObjects]; }
-    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ttforge.selfUid"];
-    TTStrictSelfUid();
-    TTLog(@"状态设置 重置锁定：已清 uid 锁定与候选（当前自动识别 uid=%u）", gSelfUid);
-    [self rebuildRows];
-}
-
-- (void)panelCustomId {
+static void TTPresentCustomIdAlert(dispatch_block_t reloadBlock) {
+    UIWindow *mw = TTKeyWindow();
+    UIViewController *root = mw ? mw.rootViewController : nil;
+    while (root.presentedViewController) root = root.presentedViewController;
+    if (!root) return;
     NSString *real = TTMyRealAccount();
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"显示ID"
         message:(real.length ? [NSString stringWithFormat:@"真实ID：%@（仅本机显示，不影响账号本身）", real] : @"仅本机显示，不影响账号本身")
@@ -5073,7 +4723,6 @@ static TTForgePanel *gTTPanel = nil;
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
         tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
-    __block TTForgePanel *bs = self;
     [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         NSString *t = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (t.length) {
@@ -5083,17 +4732,12 @@ static TTForgePanel *gTTPanel = nil;
             [gCustomId release];
             gCustomId = [t copy];
             [[NSUserDefaults standardUserDefaults] setObject:gCustomId forKey:@"ttforge.customId"];
-            id me = TTCMePlayer();
-            if (me) {
-                TTSnapObj(me, @"account", @selector(account));
-                TTSetObj(me, @selector(setAccount:), gCustomId);
-            }
             TTRestoreAndReforgeGPB();
             TTRelabelVisibleIdLabels(realAcc, gCustomId);
             TTLog(@"账号 显示ID → %@ (真实ID=%@)", gCustomId, realAcc ?: @"未捕获");
             TTApplyForgeStateNow(@"显示ID");
         }
-        [bs rebuildRows];
+        if (reloadBlock) reloadBlock();
     }]];
     if (gCustomId.length) {
         [ac addAction:[UIAlertAction actionWithTitle:@"清除（恢复真实ID）" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
@@ -5105,228 +4749,411 @@ static TTForgePanel *gTTPanel = nil;
             TTRestoreAndReforgeGPB();
             id me = TTCMePlayer();
             NSString *meReal = (me ? objc_getAssociatedObject(me, &kTTRealAccKey) : nil) ?: realAcc;
-            if (me && meReal.length) TTSetObj(me, @selector(setAccount:), meReal);
             NSString *restoreToken = meReal ?: realAcc;
             if (restoreToken.length) {
                 NSString *cleanRestore = ([restoreToken hasPrefix:@"tt"] || [restoreToken hasPrefix:@"TT"]) ? [restoreToken substringFromIndex:2] : restoreToken;
                 NSString *finalRestore = cleanRestore.length ? cleanRestore : restoreToken;
-                TTRelabelSingleToken(oldCustom, finalRestore);
-                if (gLastSelfLayoutCtx && (origH_isMe ? origH_isMe(gLastSelfLayoutCtx, @selector(isMe)) : TTGetBool(gLastSelfLayoutCtx, @selector(isMe)))) {
-                    UIView *idv = TTGetObj(gLastSelfLayoutCtx, @selector(IdView));
-                    if ([idv isKindOfClass:[UIView class]]) TTRelabelIdSubtree(idv, finalRestore);
+                id selfCtx = TTGetLastSelfLayoutCtx();
+                if (selfCtx && TTContextEffectiveIsMe(selfCtx)) {
+                    UIView *idv = TTGetObj(selfCtx, @selector(IdView));
+                    if ([idv isKindOfClass:[UIView class]]) {
+                        TTRelabelViewTokens(idv, oldCustom, finalRestore);
+                        TTRelabelIdSubtree(idv, finalRestore);
+                    }
                 }
             }
             TTLog(@"账号 显示ID 已清除 (恢复为 %@)", restoreToken ?: @"原样");
             TTApplyForgeStateNow(@"显示ID");
-            [bs rebuildRows];
+            if (reloadBlock) reloadBlock();
         }]];
     }
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
+    [root presentViewController:ac animated:YES completion:nil];
 }
 
-- (void)panelNamePreset {
-    TTNameStylePicker *pk = [[[TTNameStylePicker alloc] init] autorelease];
-    pk.panel = self;
-    TTConfigureSheetModal(pk);
-    [self presentViewController:pk animated:YES completion:nil];
+static void TTPresentRTDressIdAlert(dispatch_block_t reloadBlock) {
+    UIWindow *mw = TTKeyWindow();
+    UIViewController *root = mw ? mw.rootViewController : nil;
+    while (root.presentedViewController) root = root.presentedViewController;
+    if (!root) return;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"皮肤DressId"
+        message:@"填房间套装 DressId，0 表示只记录不替换"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = gRTDressId ? [NSString stringWithFormat:@"%u", gRTDressId] : @"";
+        tf.placeholder = @"DressId";
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSString *t = ac.textFields.firstObject.text ?: @"";
+        gRTDressId = (uint32_t)[t intValue];
+        [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)gRTDressId forKey:@"ttforge.rtDressId"];
+        TTLog(@"状态设置 皮肤DressId → %u", gRTDressId);
+        if (reloadBlock) reloadBlock();
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [root presentViewController:ac animated:YES completion:nil];
 }
 
-- (void)presentLevelPicker:(TTLevelPickerType)type {
-    TTLevelPicker *pk = [[[TTLevelPicker alloc] init] autorelease];
-    pk.pickerType = type;
-    pk.panel = self;
-    TTConfigureSheetModal(pk);
-    [self presentViewController:pk animated:YES completion:nil];
+static void TTRegisterNovaUIModules(void) {
+    NovaUIManager *ui = [NovaUIManager sharedManager];
+    ui.panelTitle = @"TTForge 控制中心";
+    ui.panelSubtitle = @"PLUGIN CONTROL CENTER  ·  v7.33";
+
+    [ui registerPickerModule:@"memberLevel"
+                       title:@"会员等级"
+                    subtitle:@"伪造 SVIP 会员等级与专属特权"
+                        icon:@"crown.fill"
+               valueProvider:^NSString *{ return TTMemberLevelName(); }
+             optionsProvider:^NSArray<NSDictionary *> *{
+                 NSArray *raw = @[
+                     @{@"t": @"原样（真实数据）", @"v": @0},
+                     @{@"t": @"SVIP 1", @"v": @1}, @{@"t": @"SVIP 2", @"v": @2},
+                     @{@"t": @"SVIP 3", @"v": @3}, @{@"t": @"SVIP 4", @"v": @4},
+                     @{@"t": @"SVIP 5", @"v": @5}, @{@"t": @"SVIP 6", @"v": @6},
+                     @{@"t": @"SVIP 7", @"v": @7}, @{@"t": @"SVIP 8（满级）", @"v": @8},
+                 ];
+                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:raw.count];
+                 for (NSDictionary *it in raw) {
+                     NSInteger v = [it[@"v"] integerValue];
+                     [opts addObject:@{@"title": it[@"t"], @"value": @(v), @"selected": @(v == gMemberLevel)}];
+                 }
+                 return opts;
+             }
+            selectionHandler:^(NSInteger index, id value) {
+                gMemberLevel = [value integerValue];
+                [[NSUserDefaults standardUserDefaults] setInteger:gMemberLevel forKey:@"ttforge.memberLevel"];
+                TTRestoreAndReforgeGPB();
+                TTLog(@"面板 会员等级 → %ld", (long)gMemberLevel);
+                TTApplyForgeStateNow(@"会员等级");
+            }];
+
+    [ui registerPickerModule:@"nobleLevel"
+                       title:@"贵族等级"
+                    subtitle:@"伪造贵族爵位、徽章、H5贵族中心与神秘人"
+                        icon:@"sparkles"
+               valueProvider:^NSString *{ return TTNobleLevelName(); }
+             optionsProvider:^NSArray<NSDictionary *> *{
+                 NSArray *raw = @[
+                     @{@"t": @"原样（真实数据）", @"v": @0},
+                     @{@"t": @"1级 · 少爵", @"v": @1}, @{@"t": @"2级 · 男爵", @"v": @2},
+                     @{@"t": @"3级 · 子爵", @"v": @3}, @{@"t": @"4级 · 伯爵", @"v": @4},
+                     @{@"t": @"5级 · 侯爵", @"v": @5}, @{@"t": @"6级 · 公爵", @"v": @6},
+                     @{@"t": @"7级 · 郡王", @"v": @7}, @{@"t": @"8级 · 亲王", @"v": @8},
+                     @{@"t": @"9级 · 国王", @"v": @9}, @{@"t": @"10级 · 神王（满级）", @"v": @10},
+                 ];
+                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:raw.count];
+                 for (NSDictionary *it in raw) {
+                     NSInteger v = [it[@"v"] integerValue];
+                     [opts addObject:@{@"title": it[@"t"], @"value": @(v), @"selected": @(v == gNobleLevel)}];
+                 }
+                 return opts;
+             }
+            selectionHandler:^(NSInteger index, id value) {
+                gNobleLevel = [value integerValue];
+                [[NSUserDefaults standardUserDefaults] setInteger:gNobleLevel forKey:@"ttforge.nobleLevel"];
+                TTRestoreAndReforgeGPB();
+                TTLog(@"面板 贵族等级 → %ld", (long)gNobleLevel);
+                TTApplyForgeStateNow(@"贵族等级");
+            }];
+
+    [ui registerPickerModule:@"nameStyle"
+                       title:@"名字样式"
+                    subtitle:@"聊天、麦位与主页昵称渐变炫彩样式"
+                        icon:@"paintbrush.fill"
+               valueProvider:^NSString *{ return TTNamePresetName(); }
+             optionsProvider:^NSArray<NSDictionary *> *{
+                 NSArray *presets = TTNamePresetList();
+                 NSString *nick = TTMyNickname();
+                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:presets.count];
+                 for (NSDictionary *pr in presets) {
+                     NSInteger ps = [pr[@"s"] integerValue], pcIdx = [pr[@"c"] integerValue];
+                     [opts addObject:@{
+                         @"title": pr[@"t"],
+                         @"attrTitle": TTNamePreviewAttr(nick, ps, pcIdx),
+                         @"value": pr,
+                         @"selected": @(ps == gNameStyle && pcIdx == gNameColorIndex)
+                     }];
+                 }
+                 return opts;
+             }
+            selectionHandler:^(NSInteger index, id value) {
+                if (![value isKindOfClass:[NSDictionary class]]) return;
+                NSDictionary *pr = (NSDictionary *)value;
+                gNameStyle = [pr[@"s"] integerValue];
+                gNameColorIndex = [pr[@"c"] integerValue];
+                NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+                [ud setInteger:gNameStyle forKey:@"ttforge.nameStyle"];
+                [ud setBool:(gNameStyle != 0) forKey:@"ttforge.nameColor"];
+                [ud setInteger:gNameColorIndex forKey:@"ttforge.nameColorIndex"];
+                TTLog(@"面板 名字样式 → %@", TTNamePresetName());
+                TTApplyForgeStateNow(@"名字样式");
+            }];
+
+    [ui registerActionModule:@"customId"
+                       title:@"显示ID"
+                    subtitle:@"自定义本机主页与贵族中心显示的TT号"
+                        icon:@"person.text.rectangle.fill"
+               valueProvider:^NSString *{ return gCustomId.length ? gCustomId : @"原样"; }
+               actionHandler:^(UIView *panelView, dispatch_block_t reloadBlock) {
+                   TTPresentCustomIdAlert(reloadBlock);
+               }];
+
+    [ui registerSwitchModule:@"blockReport"
+                       title:@"访问隐身"
+                    subtitle:@"访问他人主页不留访客记录与足迹"
+                        icon:@"eye.slash.fill"
+               stateProvider:^BOOL{ return gBlockReport; }
+                     handler:^(BOOL enabled) {
+                         gBlockReport = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gBlockReport forKey:@"ttforge.blockReport"];
+                         TTLog(@"状态设置 访问隐身 → %@", gBlockReport ? @"开" : @"关");
+                     }];
+
+    [ui registerSwitchModule:@"sneakAll"
+                       title:@"悄悄看所有人"
+                    subtitle:@"已读消息不发回执，悄悄查看会话"
+                        icon:@"eye.fill"
+               stateProvider:^BOOL{ return gSneakAll; }
+                     handler:^(BOOL enabled) {
+                         gSneakAll = enabled;
+                         [[NSUserDefaults standardUserDefaults] setBool:gSneakAll forKey:@"ttforge.sneakAll"];
+                         TTLog(@"状态设置 悄悄看所有人 → %@", gSneakAll ? @"开" : @"关");
+                     }];
+
+    [ui registerPickerModule:@"charmLevel"
+                       title:@"魅力等级"
+                    subtitle:@"个人资料页魅力称号与等级展示"
+                        icon:@"heart.fill"
+               valueProvider:^NSString *{ return TTCharmLevelName(); }
+             optionsProvider:^NSArray<NSDictionary *> *{
+                 NSArray *raw = @[
+                     @{@"t": @"原样（真实数据）", @"v": @0},
+                     @{@"t": @"初见锋芒", @"v": @10}, @{@"t": @"见习偶像", @"v": @11},
+                     @{@"t": @"名声大振", @"v": @101}, @{@"t": @"人气之星", @"v": @1001},
+                     @{@"t": @"光辉夺目", @"v": @10001}, @{@"t": @"风华绝代", @"v": @100001},
+                     @{@"t": @"永恒璀璨", @"v": @1000001},
+                 ];
+                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:raw.count];
+                 for (NSDictionary *it in raw) {
+                     NSInteger v = [it[@"v"] integerValue];
+                     BOOL sel = (v == gCharmLevelVal) || (v > 0 && gCharmLevelVal > 0 && TTTitleBandForValue(v) == TTTitleBandForValue(gCharmLevelVal));
+                     [opts addObject:@{@"title": it[@"t"], @"value": @(v), @"selected": @(sel)}];
+                 }
+                 return opts;
+             }
+            selectionHandler:^(NSInteger index, id value) {
+                gCharmLevelVal = [value integerValue];
+                [[NSUserDefaults standardUserDefaults] setInteger:gCharmLevelVal forKey:@"ttforge.charmLevelVal"];
+                TTRestoreAndReforgeGPB();
+                TTLog(@"面板 魅力等级 → %ld", (long)gCharmLevelVal);
+                TTApplyForgeStateNow(@"魅力等级");
+            }];
+
+    [ui registerPickerModule:@"richLevel"
+                       title:@"财富等级"
+                    subtitle:@"个人资料页财富称号与等级展示"
+                        icon:@"bitcoinsign.circle.fill"
+               valueProvider:^NSString *{ return TTRichLevelName(); }
+             optionsProvider:^NSArray<NSDictionary *> *{
+                 NSArray *raw = @[
+                     @{@"t": @"原样（真实数据）", @"v": @0},
+                     @{@"t": @"优雅才子", @"v": @10}, @{@"t": @"圣殿绅士", @"v": @11},
+                     @{@"t": @"荣耀城主", @"v": @101}, @{@"t": @"尊贵诸侯", @"v": @1001},
+                     @{@"t": @"枭雄霸王", @"v": @10001}, @{@"t": @"至尊帝皇", @"v": @100001},
+                     @{@"t": @"永恒帝尊", @"v": @1000001},
+                 ];
+                 NSMutableArray *opts = [NSMutableArray arrayWithCapacity:raw.count];
+                 for (NSDictionary *it in raw) {
+                     NSInteger v = [it[@"v"] integerValue];
+                     BOOL sel = (v == gRichLevelVal) || (v > 0 && gRichLevelVal > 0 && TTTitleBandForValue(v) == TTTitleBandForValue(gRichLevelVal));
+                     [opts addObject:@{@"title": it[@"t"], @"value": @(v), @"selected": @(sel)}];
+                 }
+                 return opts;
+             }
+            selectionHandler:^(NSInteger index, id value) {
+                gRichLevelVal = [value integerValue];
+                [[NSUserDefaults standardUserDefaults] setInteger:gRichLevelVal forKey:@"ttforge.richLevelVal"];
+                TTRestoreAndReforgeGPB();
+                TTLog(@"面板 财富等级 → %ld", (long)gRichLevelVal);
+                TTApplyForgeStateNow(@"财富等级");
+            }];
+
+    [ui registerActionModule:@"uidLock"
+                       title:@"账号锁定"
+                    subtitle:@"点按轮换候选UID锁定"
+                        icon:@"lock.shield.fill"
+               valueProvider:^NSString *{ return gSelfUid ? [NSString stringWithFormat:@"uid=%u", gSelfUid] : @"未锁定"; }
+               actionHandler:^(UIView *panelView, dispatch_block_t reloadBlock) {
+                   @try {
+                       NSArray *keys = nil;
+                       @synchronized (gHits) {
+                           keys = [[gHits keysSortedByValueUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                               return [b[@"count"] compare:a[@"count"]];
+                           }] retain];
+                       }
+                       if (keys.count) {
+                           NSUInteger idx = 0;
+                           for (NSUInteger i = 0; i < keys.count; i++) {
+                               if ([keys[i] unsignedIntValue] == gSelfUid) { idx = (i + 1) % keys.count; break; }
+                           }
+                           gSelfUid = [keys[idx] unsignedIntValue];
+                           [[NSUserDefaults standardUserDefaults] setObject:@(gSelfUid) forKey:@"ttforge.selfUid"];
+                           TTLog(@"状态设置 账号锁定 → uid=%u %@（候选 %lu 个，点按轮换）", gSelfUid,
+                                 gHits[@(gSelfUid)][@"nickname"] ?: @"", (unsigned long)keys.count);
+                       } else {
+                           TTLog(@"状态设置 账号锁定：暂无候选（先浏览任意主页/资料页产生命中）");
+                       }
+                       [keys release];
+                   } @catch (id e) { TTLog(@"账号锁定异常 %@", e); }
+                   TTApplyForgeStateNow(@"账号锁定");
+                   if (reloadBlock) reloadBlock();
+               }];
+
+    [ui registerActionModule:@"resetLock"
+                       title:@"重置锁定"
+                    subtitle:@"清除UID锁定与候选缓存并重新识别"
+                        icon:@"arrow.counterclockwise"
+               valueProvider:^NSString *{ return @"重置"; }
+               actionHandler:^(UIView *panelView, dispatch_block_t reloadBlock) {
+                   gSelfUid = 0;
+                   @synchronized (gHits) { [gHits removeAllObjects]; }
+                   @synchronized (gForgedPlayers) { [gForgedPlayers removeAllObjects]; }
+                   [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ttforge.selfUid"];
+                   TTStrictSelfUid();
+                   TTLog(@"状态设置 重置锁定：已清 uid 锁定与候选（当前自动识别 uid=%u）", gSelfUid);
+                   if (reloadBlock) reloadBlock();
+               }];
+
+    [ui registerSubmenuModule:@"logMenu"
+                        title:@"日志菜单"
+                     subtitle:@"H5抓取开关、运行日志导出与清空"
+                         icon:@"doc.text.magnifyingglass"
+                valueProvider:^NSString *{
+                    return gH5Capture ? [NSString stringWithFormat:@"抓取开 · %@", TTLogFileSizeText()] : TTLogFileSizeText();
+                }
+                itemsProvider:^NSArray<NSDictionary *> *{
+                    id sp = [^BOOL{ return gH5Capture; } copy];
+                    id sh = [^(BOOL enabled) {
+                        gH5Capture = enabled;
+                        [[NSUserDefaults standardUserDefaults] setBool:gH5Capture forKey:@"ttforge.h5capture"];
+                        TTLog(@"状态设置 H5抓取 → %@（K 层门控实时读取，即时生效）", gH5Capture ? @"开" : @"关");
+                    } copy];
+                    id expVal = [^NSString *{ return TTLogFileSizeText(); } copy];
+                    id expAct = [^(UIView *pv, dispatch_block_t rb) {
+                        [[NovaUIManager sharedManager] hidePanel];
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            TTExportLogFile();
+                        });
+                    } copy];
+                    id clrVal = [^NSString *{ return @"立即清空"; } copy];
+                    id clrAct = [^(UIView *pv, dispatch_block_t rb) {
+                        TTClearLogFile();
+                        if (rb) rb();
+                    } copy];
+                    NSArray *items = @[
+                        @{
+                            @"type": @"switch",
+                            @"key": @"h5capture",
+                            @"title": @"H5抓取",
+                            @"subtitle": @"捕获 H5 请求与响应报文写入日志",
+                            @"icon": @"network",
+                            @"stateProvider": [sp autorelease],
+                            @"handler": [sh autorelease]
+                        },
+                        @{
+                            @"type": @"action",
+                            @"key": @"exportLog",
+                            @"title": @"导出日志",
+                            @"subtitle": @"通过系统分享面板导出 ttforge.log",
+                            @"icon": @"square.and.arrow.up",
+                            @"valueProvider": [expVal autorelease],
+                            @"actionHandler": [expAct autorelease]
+                        },
+                        @{
+                            @"type": @"action",
+                            @"key": @"clearLog",
+                            @"title": @"清空日志",
+                            @"subtitle": @"删除本地日志文件并释放存储空间",
+                            @"icon": @"trash",
+                            @"valueProvider": [clrVal autorelease],
+                            @"actionHandler": [clrAct autorelease]
+                        }
+                    ];
+                    return items;
+                }];
+
+    [ui registerSubmenuModule:@"roomTest"
+                        title:@"房间测试"
+                     subtitle:@"防闭麦、防清屏、192k、皮肤、防踢、万能上麦、灵动岛"
+                         icon:@"mic.fill"
+                valueProvider:^NSString *{
+                    int n = (gRTAntiMute ? 1 : 0) + (gRTAntiClear ? 1 : 0) + (gRTAudio192 ? 1 : 0) + (gRTSkin ? 1 : 0) + (gRTAntiKick ? 1 : 0) + (gRTUpMic ? 1 : 0) + (gRTIsland ? 1 : 0);
+                    return n ? [NSString stringWithFormat:@"已开 %d 项", n] : @"全关";
+                }
+                itemsProvider:^NSArray<NSDictionary *> *{
+                    id muteSP = [^BOOL{ return gRTAntiMute; } copy];
+                    id muteSH = [^(BOOL enabled) {
+                        gRTAntiMute = enabled;
+                        [[NSUserDefaults standardUserDefaults] setBool:gRTAntiMute forKey:@"ttforge.rtAntiMute"];
+                        TTLog(@"状态设置 防闭麦 → %@", gRTAntiMute ? @"开" : @"关");
+                    } copy];
+                    id clearSP = [^BOOL{ return gRTAntiClear; } copy];
+                    id clearSH = [^(BOOL enabled) {
+                        gRTAntiClear = enabled;
+                        [[NSUserDefaults standardUserDefaults] setBool:gRTAntiClear forKey:@"ttforge.rtAntiClear"];
+                        TTLog(@"状态设置 防清屏 → %@", gRTAntiClear ? @"开" : @"关");
+                    } copy];
+                    id audioSP = [^BOOL{ return gRTAudio192; } copy];
+                    id audioSH = [^(BOOL enabled) {
+                        gRTAudio192 = enabled;
+                        [[NSUserDefaults standardUserDefaults] setBool:gRTAudio192 forKey:@"ttforge.rtAudio192"];
+                        TTLog(@"状态设置 192k音质 → %@", gRTAudio192 ? @"开" : @"关");
+                    } copy];
+                    id skinSP = [^BOOL{ return gRTSkin; } copy];
+                    id skinSH = [^(BOOL enabled) {
+                        gRTSkin = enabled;
+                        [[NSUserDefaults standardUserDefaults] setBool:gRTSkin forKey:@"ttforge.rtSkin"];
+                        TTLog(@"状态设置 皮肤DressId → %@", gRTSkin ? @"开" : @"关");
+                    } copy];
+                    id dressVal = [^NSString *{ return gRTDressId ? [NSString stringWithFormat:@"%u", gRTDressId] : @"0（只记录）"; } copy];
+                    id dressAct = [^(UIView *pv, dispatch_block_t rb) {
+                        TTPresentRTDressIdAlert(rb);
+                    } copy];
+                    id kickSP = [^BOOL{ return gRTAntiKick; } copy];
+                    id kickSH = [^(BOOL enabled) {
+                        gRTAntiKick = enabled;
+                        [[NSUserDefaults standardUserDefaults] setBool:gRTAntiKick forKey:@"ttforge.rtAntiKick"];
+                        TTLog(@"状态设置 防踢 → %@", gRTAntiKick ? @"开" : @"关");
+                    } copy];
+                    id upSP = [^BOOL{ return gRTUpMic; } copy];
+                    id upSH = [^(BOOL enabled) {
+                        gRTUpMic = enabled;
+                        [[NSUserDefaults standardUserDefaults] setBool:gRTUpMic forKey:@"ttforge.rtUpMic"];
+                        TTLog(@"状态设置 万能上麦 → %@", gRTUpMic ? @"开" : @"关");
+                    } copy];
+                    id islSP = [^BOOL{ return gRTIsland; } copy];
+                    id islSH = [^(BOOL enabled) {
+                        gRTIsland = enabled;
+                        [[NSUserDefaults standardUserDefaults] setBool:gRTIsland forKey:@"ttforge.rtIsland"];
+                        TTLog(@"状态设置 灵动岛记录 → %@", gRTIsland ? @"开" : @"关");
+                    } copy];
+                    NSArray *items = @[
+                        @{@"type": @"switch", @"key": @"rtAntiMute", @"title": @"防闭麦", @"subtitle": @"房主闭麦指令本地不执行", @"icon": @"mic.slash.fill", @"stateProvider": [muteSP autorelease], @"handler": [muteSH autorelease]},
+                        @{@"type": @"switch", @"key": @"rtAntiClear", @"title": @"防清屏", @"subtitle": @"清屏指令本地不执行，聊天记录保留", @"icon": @"text.bubble.fill", @"stateProvider": [clearSP autorelease], @"handler": [clearSH autorelease]},
+                        @{@"type": @"switch", @"key": @"rtAudio192", @"title": @"192k音质", @"subtitle": @"音频码率本地替换为 192000（测试值）", @"icon": @"waveform", @"stateProvider": [audioSP autorelease], @"handler": [audioSH autorelease]},
+                        @{@"type": @"switch", @"key": @"rtSkin", @"title": @"皮肤DressId", @"subtitle": @"房间套装更新时替换为填入的 DressId", @"icon": @"paintpalette.fill", @"stateProvider": [skinSP autorelease], @"handler": [skinSH autorelease]},
+                        @{@"type": @"action", @"key": @"rtDressId", @"title": @"皮肤DressId值", @"subtitle": @"填房间套装 DressId，0 表示只记录", @"icon": @"number", @"valueProvider": [dressVal autorelease], @"actionHandler": [dressAct autorelease]},
+                        @{@"type": @"switch", @"key": @"rtAntiKick", @"title": @"防踢", @"subtitle": @"踢出与踢下麦消息本地不执行", @"icon": @"hand.raised.fill", @"stateProvider": [kickSP autorelease], @"handler": [kickSH autorelease]},
+                        @{@"type": @"switch", @"key": @"rtUpMic", @"title": @"万能上麦", @"subtitle": @"上麦权限判断本地放行", @"icon": @"mic.fill", @"stateProvider": [upSP autorelease], @"handler": [upSH autorelease]},
+                        @{@"type": @"switch", @"key": @"rtIsland", @"title": @"灵动岛记录", @"subtitle": @"只记录灵动岛容器与注册调用", @"icon": @"bell.fill", @"stateProvider": [islSP autorelease], @"handler": [islSH autorelease]}
+                    ];
+                    return items;
+                }];
+
+    [ui install];
 }
-
-- (void)panelMemberLevel { [self presentLevelPicker:TTLevelPickerMember]; }
-- (void)panelNobleLevel  { [self presentLevelPicker:TTLevelPickerNoble];  }
-- (void)panelRichLevel   { [self presentLevelPicker:TTLevelPickerRich];   }
-- (void)panelCharmLevel  { [self presentLevelPicker:TTLevelPickerCharm];  }
-
-- (void)rebuildRows {
-    if (!_box) return;
-    for (UIView *v in [[_box.subviews copy] autorelease]) [v removeFromSuperview];
-    CGFloat w = _box.bounds.size.width;
-    if (w < 200) w = self.view.bounds.size.width;
-    if (w < 200) w = [UIScreen mainScreen].bounds.size.width;
-    UIFont *rowFont = [UIFont systemFontOfSize:16];
-    UIFont *hdrFont = [UIFont systemFontOfSize:12];
-    CGFloat y = 6;
-    NSArray *items = @[
-        @{@"kind": @"act", @"title": @"会员等级",     @"sel": @"panelMemberLevel", @"value": TTMemberLevelName()},
-        @{@"kind": @"act", @"title": @"贵族等级",     @"sel": @"panelNobleLevel",  @"value": TTNobleLevelName()},
-        @{@"kind": @"sw",  @"title": @"访问隐身",     @"sel": @"blockSwitchChanged:",  @"val": @(gBlockReport)},
-        @{@"kind": @"sw",  @"title": @"悄悄看所有人", @"sel": @"sneakSwitchChanged:",  @"val": @(gSneakAll)},
-        @{@"kind": @"act", @"title": @"名字样式",     @"sel": @"panelNamePreset", @"value": TTNamePresetName(), @"preview": @YES},
-        @{@"kind": @"act", @"title": @"显示ID",       @"sel": @"panelCustomId",  @"value": (gCustomId.length ? gCustomId : @"原样")},
-        @{@"kind": @"act", @"title": @"魅力等级",     @"sel": @"panelCharmLevel",  @"value": TTCharmLevelName()},
-        @{@"kind": @"act", @"title": @"财富等级",     @"sel": @"panelRichLevel",   @"value": TTRichLevelName()},
-        @{@"kind": @"hdr", @"title": @"插件工具"},
-        @{@"kind": @"sw",  @"title": @"H5抓取",       @"sel": @"h5SwitchChanged:",     @"val": @(gH5Capture)},
-        @{@"kind": @"act", @"title": @"导出日志",     @"sel": @"panelExport",  @"value": @""},
-        @{@"kind": @"act", @"title": @"清空日志",     @"sel": @"panelClear",   @"value": @""},
-        @{@"kind": @"hdr", @"title": @"房间测试"},
-        @{@"kind": @"sw",  @"title": @"防闭麦",       @"sel": @"rtAntiMuteChanged:",  @"val": @(gRTAntiMute)},
-        @{@"kind": @"sw",  @"title": @"防清屏",       @"sel": @"rtAntiClearChanged:", @"val": @(gRTAntiClear)},
-        @{@"kind": @"sw",  @"title": @"192k音质",     @"sel": @"rtAudio192Changed:",  @"val": @(gRTAudio192)},
-        @{@"kind": @"sw",  @"title": @"皮肤DressId",  @"sel": @"rtSkinChanged:",      @"val": @(gRTSkin)},
-        @{@"kind": @"act", @"title": @"皮肤DressId值", @"sel": @"panelRTDressId",     @"value": gRTDressId ? [NSString stringWithFormat:@"%u", gRTDressId] : @"0（只记录）"},
-        @{@"kind": @"sw",  @"title": @"防踢",         @"sel": @"rtAntiKickChanged:",  @"val": @(gRTAntiKick)},
-        @{@"kind": @"sw",  @"title": @"万能上麦",     @"sel": @"rtUpMicChanged:",     @"val": @(gRTUpMic)},
-        @{@"kind": @"sw",  @"title": @"灵动岛记录",   @"sel": @"rtIslandChanged:",    @"val": @(gRTIsland)},
-        @{@"kind": @"hdr", @"title": @"装扮与账号"},
-        @{@"kind": @"act", @"title": @"账号锁定",     @"sel": @"panelUidLock",  @"value": gSelfUid ? [NSString stringWithFormat:@"uid=%u 已锁定", gSelfUid] : @"未锁定（点按轮换候选）"},
-        @{@"kind": @"act", @"title": @"重置锁定",     @"sel": @"panelResetLock", @"value": @"清除锁定与候选"},
-    ];
-    for (NSDictionary *it in items) {
-        NSString *kind = it[@"kind"];
-        CGFloat rowH = [kind isEqualToString:@"hdr"] ? 30 : 52;
-        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, y, w, rowH)];
-        if ([kind isEqualToString:@"hdr"]) {
-            UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(20, 8, w - 40, 20)];
-            lab.text = it[@"title"]; lab.font = hdrFont; lab.textColor = [UIColor grayColor];
-            [row addSubview:lab]; [lab release];
-        } else if ([kind isEqualToString:@"sw"]) {
-            UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(20, 0, w - 110, rowH)];
-            lab.text = it[@"title"]; lab.font = rowFont;
-            lab.numberOfLines = 1; lab.adjustsFontSizeToFitWidth = YES; lab.minimumScaleFactor = 0.75;
-            [row addSubview:lab]; [lab release];
-            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 71, (rowH - 31) / 2, 51, 31)];
-            sw.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-            [sw setOn:[it[@"val"] boolValue] animated:NO];
-            [sw addTarget:self action:NSSelectorFromString(it[@"sel"]) forControlEvents:UIControlEventValueChanged];
-            [row addSubview:sw]; [sw release];
-        } else {
-            UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-            btn.frame = CGRectMake(0, 0, w, rowH);
-            btn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-            btn.titleEdgeInsets = UIEdgeInsetsMake(0, 20, 0, 0);
-            [btn setTitle:it[@"title"] forState:UIControlStateNormal];
-            [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
-            btn.titleLabel.font = rowFont;
-            [btn addTarget:self action:NSSelectorFromString(it[@"sel"]) forControlEvents:UIControlEventTouchUpInside];
-            [row addSubview:btn];
-            UILabel *val = [[UILabel alloc] initWithFrame:CGRectMake(MAX(w - 226, 110), 0, 190, rowH)];
-            if (it[@"preview"]) val.attributedText = TTNamePreviewAttr(TTMyNickname(), gNameStyle, gNameColorIndex);
-            else val.text = it[@"value"];
-            val.textAlignment = NSTextAlignmentRight; val.font = [UIFont systemFontOfSize:13]; val.textColor = [UIColor grayColor];
-            val.numberOfLines = 1; val.adjustsFontSizeToFitWidth = YES; val.minimumScaleFactor = 0.7;
-            val.userInteractionEnabled = NO; val.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-            [row addSubview:val]; [val release];
-        }
-        [_box addSubview:row]; [row release];
-        y += rowH;
-    }
-    _box.contentSize = CGSizeMake(w, y + 20);
-}
-@end
-
-@interface TTForgeEntryWindow : UIWindow
-@property (nonatomic, strong) UIImageView *iconView;
-+ (instancetype)shared;
-- (void)show;
-@end
-
-@implementation TTForgeEntryWindow
-+ (instancetype)shared {
-    static TTForgeEntryWindow *win = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        CGFloat scrW = [UIScreen mainScreen].bounds.size.width;
-        win = [[TTForgeEntryWindow alloc] initWithFrame:CGRectMake(scrW - 65, 200, 50, 50)];
-    });
-    return win;
-}
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    if (self = [super initWithFrame:frame]) {
-        self.windowLevel = UIWindowLevelStatusBar + 100;
-        self.backgroundColor = [UIColor clearColor];
-        self.layer.cornerRadius = 25;
-        self.layer.masksToBounds = YES;
-        self.layer.borderWidth = 1.0;
-        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
-
-        UIVisualEffect *eff = nil;
-        Class glassCls = NSClassFromString(@"UIGlassEffect");
-        if (glassCls && [glassCls respondsToSelector:@selector(effectWithStyle:)]) {
-            id g = ((id (*)(id, SEL, NSInteger))objc_msgSend)(glassCls, @selector(effectWithStyle:), (NSInteger)1);
-            TTSetBool(g, @selector(setInteractive:), YES);
-            if ([g isKindOfClass:[UIVisualEffect class]]) eff = (UIVisualEffect *)g;
-        }
-        if (!eff) eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
-        UIVisualEffectView *ve = [[UIVisualEffectView alloc] initWithEffect:eff];
-        ve.frame = self.bounds;
-        ve.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        ve.userInteractionEnabled = NO;
-        [self addSubview:ve]; [ve release];
-
-        _iconView = [[UIImageView alloc] initWithFrame:CGRectMake(2, 2, self.bounds.size.width - 4, self.bounds.size.height - 4)];
-        _iconView.layer.cornerRadius = 23;
-        _iconView.layer.masksToBounds = YES;
-        _iconView.contentMode = UIViewContentModeScaleAspectFill;
-        [self addSubview:_iconView];
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)];
-        [self addGestureRecognizer:pan]; [pan release];
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tap:)];
-        [tap requireGestureRecognizerToFail:pan];
-        [self addGestureRecognizer:tap]; [tap release];
-    }
-    return self;
-}
-
-- (void)pan:(UIPanGestureRecognizer *)pan {
-    CGPoint p = [pan translationInView:self];
-    self.center = CGPointMake(self.center.x + p.x, self.center.y + p.y);
-    [pan setTranslation:CGPointMake(0, 0) inView:self];
-    if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
-        CGSize scr = [UIScreen mainScreen].bounds.size;
-        CGFloat finalX = (self.center.x > scr.width / 2) ? scr.width - 35 : 35;
-        CGFloat finalY = MAX(100, MIN(self.center.y, scr.height - 100));
-        [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-            self.center = CGPointMake(finalX, finalY);
-        } completion:nil];
-    }
-}
-
-- (void)tap:(UITapGestureRecognizer *)tap {
-    TTLog(@"悬浮入口 被点击");
-    [TTForgePanel showPanel];
-}
-
-- (void)show {
-    if (!self.windowScene) {
-        UIWindowScene *best = nil;
-        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-            if ([sc isKindOfClass:[UIWindowScene class]]) {
-                best = (UIWindowScene *)sc;
-                if (sc.activationState == UISceneActivationStateForegroundActive) break;
-            }
-        }
-        if (best) {
-            self.windowScene = best;
-            CGRect f = self.frame;
-            if (f.origin.x < 0 || f.origin.x > best.screen.bounds.size.width) {
-                f.origin.x = best.screen.bounds.size.width - 65;
-                f.origin.y = 200;
-                self.frame = f;
-            }
-        }
-    }
-    if (self.windowScene || [UIApplication sharedApplication].windows.count) {
-        self.hidden = NO;
-        TTLog(@"悬浮入口已显示（液态玻璃按钮，点开独立面板）");
-        return;
-    }
-    static int retry = 0;
-    if (retry++ < 30) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self show]; });
-    }
-}
-@end
 
 static void (*origU_setBubbleId)(id, SEL, uint32_t);
 static void TTU_setBubbleId(id self, SEL _cmd, uint32_t dressId) {
@@ -5467,7 +5294,7 @@ static int64_t TTU_bridgeBubble(id self, SEL _cmd, id param, id callback, id fro
     @try {
         uint32_t did = TTExtractDressIdFromParam(param);
         TTLog(@"H5BRIDGE data_changeMyIMBubbleDressId param=%@ 解析dressId=%u", param, did);
-        if (did > 0) TTApplyH5Dress(4, did);
+        TTApplyH5Dress(4, did);
     } @catch (id e) {}
     return origU_bridgeBubble ? origU_bridgeBubble(self, _cmd, param, callback, from) : 0;
 }
@@ -5477,7 +5304,7 @@ static int64_t TTU_bridgeChatBg(id self, SEL _cmd, id param, id callback, id fro
     @try {
         uint32_t did = TTExtractDressIdFromParam(param);
         TTLog(@"H5BRIDGE data_changeIMBackgroundDressId param=%@ 解析dressId=%u", param, did);
-        if (did > 0) TTApplyH5Dress(3, did);
+        TTApplyH5Dress(3, did);
     } @catch (id e) {}
     return origU_bridgeChatBg ? origU_bridgeChatBg(self, _cmd, param, callback, from) : 0;
 }
@@ -5495,16 +5322,16 @@ static void TTU_jsInvoke(id self, SEL _cmd, id name, id parameter, id callback) 
             }
             if ([nm isEqualToString:@"data_changeMyIMBubbleDressId"]) {
                 uint32_t did = TTExtractDressIdFromParam(parameter);
-                if (did > 0) TTApplyH5Dress(4, did);
+                TTApplyH5Dress(4, did);
             } else if ([nm isEqualToString:@"data_changeIMBackgroundDressId"]) {
                 uint32_t did = TTExtractDressIdFromParam(parameter);
-                if (did > 0) TTApplyH5Dress(3, did);
+                TTApplyH5Dress(3, did);
             } else if ([nm isEqualToString:@"data_changeMySpecialConcernDressId"] || [nm isEqualToString:@"data_changeSpecialConcernDressId"]) {
                 uint32_t did = TTExtractDressIdFromParam(parameter);
-                if (did > 0) TTApplyH5Dress(2, did);
+                TTApplyH5Dress(2, did);
             } else if ([nm isEqualToString:@"data_changeMyRoomDressId"] || [nm isEqualToString:@"data_changeRoomDressId"]) {
                 uint32_t did = TTExtractDressIdFromParam(parameter);
-                if (did > 0) TTApplyH5Dress(1, did);
+                TTApplyH5Dress(1, did);
             } else if ([nm isEqualToString:@"data_ttforge_applyDress"] || [nm isEqualToString:@"ttforge_applyDress"]) {
                 uint32_t dt = TTExtractDressTypeFromParam(parameter);
                 uint32_t did = TTExtractDressIdFromParam(parameter);
@@ -6110,23 +5937,24 @@ __attribute__((constructor)) static void TTForgeInit(void) {
               gBubbleDressId, gChatBgDressId, gSpecialDressId, gRoomDressId);
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            uint32_t initUid = TTStrictSelfUid();
-            id initMe = TTCMePlayer();
-            if (initMe) {
-                TTRegisterForgedPlayer(initMe);
-                TTMyRealAccount();
-                if (initUid > 0) TTTagNobilityInfoOnObject(initMe, initUid);
-                if (gCustomId.length) {
-                    TTSnapObj(initMe, @"account", @selector(account));
-                    TTSetObj(initMe, @selector(setAccount:), gCustomId);
+            @try {
+                uint32_t initUid = TTStrictSelfUid();
+                id initMe = TTCMePlayer();
+                if (initMe) {
+                    TTRegisterForgedPlayer(initMe);
+                    TTMyRealAccount();
+                    if (initUid > 0) TTTagNobilityInfoOnObject(initMe, initUid);
                 }
-            }
-            if (gBubbleDressId > 0) TTApplyBubbleDressNow();
-            if (gChatBgDressId > 0) TTApplyChatBgDressNow();
-            if (gSpecialDressId > 0) TTApplySpecialDressNow();
-            if (gRoomDressId > 0) TTApplyRoomDressNow();
-            if (gLastSelfLayoutCtx) TTApplySelfBadgesToContext(gLastSelfLayoutCtx);
-            [[TTForgeEntryWindow shared] show];
+                if (gBubbleDressId > 0) TTApplyBubbleDressNow();
+                if (gChatBgDressId > 0) TTApplyChatBgDressNow();
+                if (gSpecialDressId > 0) TTApplySpecialDressNow();
+                if (gRoomDressId > 0) TTApplyRoomDressNow();
+                id selfCtx = TTGetLastSelfLayoutCtx();
+                if (selfCtx) TTApplySelfBadgesToContext(selfCtx);
+            } @catch (id e) {}
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                TTRegisterNovaUIModules();
+            });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 if (gSpecialDressId > 0) TTApplySpecialDressNow();
                 if (gRoomDressId > 0) TTApplyRoomDressNow();
